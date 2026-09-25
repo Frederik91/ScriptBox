@@ -1,653 +1,489 @@
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
-using Wasmtime;
-using ScriptBox.Core.Configuration;
-using ScriptBox.Core.HostApi;
+using System.Text.RegularExpressions;
+using System.Threading;
 using ScriptBox.Core.Runtime;
+using Wasmtime;
 
 namespace ScriptBox.Core.WasmExecution;
 
+internal sealed class ExecutionLimits
+{
+    public TimeSpan Timeout { get; init; }
+    public long MemoryBytes { get; init; }
+    public int MaxLogEntries { get; init; }
+    public int MaxLogEntryLength { get; init; }
+    public int MaxResultBytes { get; init; }
+}
+
+internal sealed record BootstrapScript(string Name, string Code);
+
 /// <summary>
-/// Executes JavaScript code within a QuickJS-in-WASM sandbox.
-/// Manages WASM module lifecycle, memory operations, and error handling.
+/// Runs one script in a fresh WASM instance. See scriptbox_wrapper.c for the
+/// guest side of the ABI implemented here.
 /// </summary>
-#if NET6_0_OR_GREATER
-internal sealed class WasmScriptExecutor : IWasmScriptExecutor, IAsyncDisposable
+/// <remarks>
+/// <see cref="Execute"/> is synchronous and blocks its thread for the whole
+/// execution, including every host call the script makes, because a WASM host
+/// import cannot yield. <see cref="ScriptSession"/> therefore runs it on a
+/// dedicated thread rather than a thread-pool one.
+/// </remarks>
+internal sealed class WasmScriptExecutor
 {
-#else
-internal sealed class WasmScriptExecutor : IWasmScriptExecutor, IDisposable
-{
-#endif
-    private readonly IHostApi _hostApi;
-    private readonly SandboxConfiguration _config;
-    private readonly Dictionary<string, Func<HostCallContext, Task<object?>>> _jsonHandlers;
-    private readonly Engine _engine;
+    public const string UserScriptName = "script.js";
+
+    // The epoch deadline sits past the timeout so the clean interrupt, which
+    // reports a proper error, gets the first chance to stop the script.
+    private static readonly TimeSpan HardStopGrace = TimeSpan.FromSeconds(2);
+    private static readonly Regex UserFrameLine = new(@"script\.js:(\d+)", RegexOptions.Compiled);
+
     private readonly Module _module;
+    private readonly IReadOnlyDictionary<string, HostMethodHandler> _handlers;
     private readonly JsonSerializerOptions _jsonOptions;
-    private readonly WasmModuleSource _moduleSource;
-    private bool _disposed;
 
     public WasmScriptExecutor(
-        IHostApi? hostApi = null,
-        SandboxConfiguration? config = null,
-        IReadOnlyDictionary<string, Func<HostCallContext, Task<object?>>>? jsonHandlers = null,
-        WasmModuleSource? moduleSource = null)
+        Module module,
+        IReadOnlyDictionary<string, HostMethodHandler> handlers,
+        JsonSerializerOptions jsonOptions)
     {
-        _config = config ?? SandboxConfiguration.CreateDefault();
-        _hostApi = hostApi ?? new HostApiImpl(_config);
-        _jsonHandlers = new Dictionary<string, Func<HostCallContext, Task<object?>>>(StringComparer.OrdinalIgnoreCase);
-        if (jsonHandlers != null)
-        {
-            foreach (var kvp in jsonHandlers)
-            {
-                _jsonHandlers[kvp.Key] = kvp.Value;
-            }
-        }
-        _moduleSource = moduleSource ?? WasmModuleSource.FromBytes(DefaultRuntimeResources.LoadEmbeddedWasm());
-        _engine = new Engine();
-        _module = _moduleSource.CreateModule(_engine);
-        
-        // Initialize JSON serializer options with appropriate settings for the target framework
-#if NET6_0_OR_GREATER
-        _jsonOptions = new(JsonSerializerDefaults.Web)
-        {
-            PropertyNameCaseInsensitive = true
-        };
-#else
-        _jsonOptions = new()
-        {
-            PropertyNameCaseInsensitive = true
-        };
-#endif
+        _module = module;
+        _handlers = handlers;
+        _jsonOptions = jsonOptions;
     }
 
-    public WasmScriptExecutor(SandboxConfiguration? config)
-        : this(null, config, null, null)
+    public ScriptExecutionResult Execute(
+        IReadOnlyList<BootstrapScript> bootstrap,
+        string userScript,
+        ScriptSession session,
+        Func<SandboxApiDescriptor, object> resolveInstance,
+        ExecutionLimits limits,
+        CancellationToken cancellationToken)
     {
+        var stopwatch = Stopwatch.StartNew();
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (limits.Timeout > TimeSpan.Zero)
+        {
+            linked.CancelAfter(limits.Timeout);
+        }
+
+        var run = new Execution(this, session, resolveInstance, limits, linked.Token);
+        using var interruptOnCancel = linked.Token.Register(run.RequestInterrupt);
+
+        ScriptError? error;
+        var stopped = false;
+        try
+        {
+            error = RunInstance(run, bootstrap, userScript, limits);
+        }
+        catch (ExecutionStoppedException)
+        {
+            stopped = true;
+            error = null;
+        }
+        catch (WasmtimeException ex) when (run.InterruptRequested && (ex is TrapException || ex.InnerException is ExecutionStoppedException))
+        {
+            // Either host.interrupt or host.call refused to go on, or the epoch deadline fired inside a native
+            // operation that never polled.
+            stopped = true;
+            error = null;
+        }
+        catch (TrapException ex) when (ex.Message.Contains("call stack exhausted"))
+        {
+            // Normally QuickJS raises its catchable "stack overflow" first; see WasmRuntime.MaxWasmStackSize.
+            error = new ScriptError(ScriptErrorKind.Exception, "InternalError", "stack overflow", null, null);
+        }
+        catch (SandboxMemoryException)
+        {
+            error = new ScriptError(ScriptErrorKind.MemoryLimit, "InternalError", "The sandbox ran out of memory while loading the script.", null, null);
+        }
+        catch (WasmtimeException ex)
+        {
+            error = new ScriptError(ScriptErrorKind.Fault, "SandboxFault", ex.InnerException?.Message ?? FirstLine(ex.Message), null, null);
+        }
+
+        // Only a run the interrupt actually stopped is a timeout. One that finished while the timer fired keeps its result.
+        if (stopped)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            error = new ScriptError(
+                ScriptErrorKind.Timeout,
+                "TimeoutError",
+                $"The script was stopped after running longer than its {limits.Timeout.TotalSeconds.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture)} s timeout.",
+                null,
+                null);
+        }
+        else if (error is null && run.OversizedResultBytes is { } size)
+        {
+            error = new ScriptError(
+                ScriptErrorKind.Exception,
+                "RangeError",
+                $"The script returned {size} bytes of JSON, more than the {limits.MaxResultBytes} allowed. Return only what is needed.",
+                null,
+                null);
+        }
+
+        return new ScriptExecutionResult(
+            error is null ? run.ResultJson : null,
+            error,
+            run.Logs,
+            stopwatch.Elapsed,
+            _jsonOptions);
     }
 
-    /// <inheritdoc />
-    public WasmExecutionResult ExecuteScript(string jsCode, int? timeoutMs = null)
+    private ScriptError? RunInstance(Execution run, IReadOnlyList<BootstrapScript> bootstrap, string userScript, ExecutionLimits limits)
     {
-        if (string.IsNullOrEmpty(jsCode))
-        {
-            throw new ArgumentException("JavaScript code cannot be null or empty.", nameof(jsCode));
-        }
+        using var store = new Store(WasmRuntime.Engine);
+        store.SetLimits(memorySize: limits.MemoryBytes);
+        store.SetWasiConfiguration(new WasiConfiguration());
+        store.SetEpochDeadline(limits.Timeout > TimeSpan.Zero
+            ? WasmRuntime.TicksFor(limits.Timeout + HardStopGrace)
+            : ulong.MaxValue / 2);
 
-        var effectiveTimeout = timeoutMs ?? WasmConfiguration.DefaultTimeoutMs;
-
-        if (effectiveTimeout > 0)
-        {
-            // Use Task-based timeout for compatible timeout handling
-            var task = Task.Run(() => ExecuteScriptInternal(jsCode));
-
-            try
-            {
-                if (!task.Wait(effectiveTimeout))
-                {
-                    throw new TimeoutException(
-                        $"Script execution exceeded timeout limit of {effectiveTimeout}ms. " +
-                        "The script may have an infinite loop or is taking too long to complete.");
-                }
-                return task.Result;
-            }
-            catch (AggregateException ae)
-            {
-                // Unwrap AggregateException from Task.Wait
-                throw ae.InnerException ?? ae;
-            }
-        }
-        else
-        {
-            // No timeout - execute directly
-            return ExecuteScriptInternal(jsCode);
-        }
-    }
-
-    /// <summary>
-    /// Internal method that performs the actual script execution without timeout handling.
-    /// </summary>
-    private WasmExecutionResult ExecuteScriptInternal(string jsCode)
-    {
-        var logs = new List<string>();
-        using var linker = new Linker(_engine);
-        using var store = new Store(_engine);
-
-        ConfigureWasi(store);
-        DefineHostBridge(store, linker, logs.Add);
+        using var linker = new Linker(WasmRuntime.Engine);
+        linker.DefineWasi();
+        run.DefineImports(linker, store);
 
         var instance = linker.Instantiate(store, _module);
-        var memory = instance.GetMemory(WasmConfiguration.MemoryExportName)
-                    ?? throw new InvalidOperationException($"No {WasmConfiguration.MemoryExportName} export found");
+        var memory = instance.GetMemory("memory") ?? throw new InvalidOperationException("The module exports no memory.");
+        var init = instance.GetFunction<int>("sb_init") ?? throw MissingExport("sb_init");
+        var eval = instance.GetFunction<int, int, int, int, int, int>("sb_eval") ?? throw MissingExport("sb_eval");
+        var alloc = instance.GetFunction<int, int>("sb_alloc") ?? throw MissingExport("sb_alloc");
+        var free = instance.GetAction<int>("sb_free") ?? throw MissingExport("sb_free");
 
-        // Prepend bootstrap JS before user code
-        // Add void expression to discard bootstrap result, then evaluate user code
-        var startupJs = LoadStartupJs();
-        string fullScript;
-        if (string.IsNullOrWhiteSpace(startupJs))
+        if (init() != 0)
         {
-            fullScript = WrapUserScriptInIife(jsCode);
-        }
-        else
-        {
-            // Terminate bootstrap, add void 0 to discard any bootstrap return value,
-            // then wrap user code in an IIFE to support return statements at the top level
-            fullScript = $"{startupJs};\nvoid 0;\n{WrapUserScriptInIife(jsCode)}";
+            return run.TakeError(ScriptErrorKind.Fault);
         }
 
-        var result = ExecuteEvalFunction(instance, memory, fullScript);
-        return new WasmExecutionResult(result, logs);
+        foreach (var script in bootstrap)
+        {
+            if (Evaluate(memory, alloc, free, eval, script.Name, script.Code, reportResult: false) != 0)
+            {
+                var failure = run.TakeError(ScriptErrorKind.Fault);
+                return failure with { Message = $"Bootstrap script '{script.Name}' failed: {failure.Message}" };
+            }
+        }
+
+        // The prefix shares the first line with the user's code so reported
+        // line numbers match the submitted source.
+        var wrapped = "(async () => {\"use strict\";" + userScript + "\n})()";
+        return Evaluate(memory, alloc, free, eval, UserScriptName, wrapped, reportResult: true) == 0
+            ? null
+            : run.TakeError(ScriptErrorKind.Exception);
     }
 
-    /// <summary>
-    /// Wraps user script code in an Immediately Invoked Function Expression (IIFE).
-    /// This allows scripts to use top-level return statements, which aligns with
-    /// how AI models typically generate JavaScript code.
-    /// </summary>
-    /// <param name="jsCode">The user script code to wrap</param>
-    /// <returns>The user code wrapped in an IIFE that is immediately invoked</returns>
-    private static string WrapUserScriptInIife(string jsCode)
+    private static int Evaluate(
+        Memory memory,
+        Func<int, int> alloc,
+        Action<int> free,
+        Func<int, int, int, int, int, int> eval,
+        string name,
+        string code,
+        bool reportResult)
     {
-        return $"(function() {{\n{jsCode}\n}})()";
-    }
+        var codeBytes = Encoding.UTF8.GetBytes(code);
+        var nameBytes = Encoding.UTF8.GetBytes(name);
 
-    /// <summary>
-    /// Configures WASI for the sandbox environment.
-    /// </summary>
-    private static void ConfigureWasi(Store store)
-    {
-        store.SetWasiConfiguration(
-            new WasiConfiguration()
-                .WithArgs("guest-app-name")
-                .WithInheritedStandardOutput()
-                .WithInheritedStandardError()
-        );
-    }
-
-    /// <summary>
-    /// Defines the host.call bridge that allows QuickJS to invoke host methods.
-    /// </summary>
-    private void DefineHostBridge(Store store, Linker linker, Action<string>? onLog = null)
-    {
-        linker.DefineWasi();
-        linker.Define(
-            "host",
-            "call",
-            Function.FromCallback(
-                store,
-                (Caller caller, int inPtr, int inLen, int outPtr, int outCap) =>
-                    HandleHostCallCallback(caller, inPtr, inLen, outPtr, outCap)
-            )
-        );
-
-        // host.log: used by console.log inside QuickJS
-        linker.Define(
-            "host",
-            "log",
-            Function.FromCallback(
-                store,
-                (Caller caller, int ptr, int len) =>
-                    HandleHostLogCallback(caller, ptr, len, onLog)
-            )
-        );
-    }
-
-    private void HandleHostLogCallback(Caller caller, int ptr, int len, Action<string>? onLog)
-    {
-        var memory = caller.GetMemory(WasmConfiguration.MemoryExportName)
-                    ?? throw new InvalidOperationException("No memory export");
-
-        var message = ReadStringFromMemory(memory, ptr, len);
-        _hostApi.Log(message);
-        onLog?.Invoke(message);
-    }
-
-    /// <summary>
-    /// Callback invoked when QuickJS calls a host method.
-    /// Reads the request, dispatches it, and writes the response back to WASM memory.
-    /// </summary>
-    private int HandleHostCallCallback(Caller caller, int inPtr, int inLen, int outPtr, int outCap)
-    {
+        var codePtr = WriteBuffer(memory, alloc, codeBytes);
+        var namePtr = WriteBuffer(memory, alloc, nameBytes);
         try
         {
-            var memory = caller.GetMemory(WasmConfiguration.MemoryExportName)
-                        ?? throw new InvalidOperationException("No memory export");
+            // sb_eval frees the code buffer itself.
+            return eval(codePtr, codeBytes.Length, namePtr, nameBytes.Length, reportResult ? 1 : 0);
+        }
+        finally
+        {
+            free(namePtr);
+        }
+    }
 
-            var jsonRequest = ReadStringFromMemory(memory, inPtr, inLen);
-            var jsonResponse = HandleHostCall(jsonRequest);
-            var responseBytes = Encoding.UTF8.GetBytes(jsonResponse);
+    private static int WriteBuffer(Memory memory, Func<int, int> alloc, byte[] bytes)
+    {
+        var ptr = alloc(bytes.Length);
+        if (ptr == 0)
+        {
+            throw new SandboxMemoryException();
+        }
 
-            // Write response JSON to WASM memory
-            int bytesToWrite = Math.Min(responseBytes.Length, outCap);
-            for (var i = 0; i < bytesToWrite; i++)
+        // Fetched after alloc: growing the memory can move it.
+        bytes.AsSpan().CopyTo(memory.GetSpan(ptr, bytes.Length));
+        return ptr;
+    }
+
+    // Wasmtime appends the whole WASM backtrace to a trap's message.
+    private static string FirstLine(string message)
+    {
+        var end = message.IndexOf('\n');
+        return (end < 0 ? message : message.Substring(0, end)).TrimEnd('\r');
+    }
+
+    private sealed class SandboxMemoryException : Exception
+    {
+    }
+
+    private sealed class ExecutionStoppedException : Exception
+    {
+    }
+
+    private static InvalidOperationException MissingExport(string name)
+    {
+        return new InvalidOperationException($"The WASM module does not export '{name}'. It was built for another version of ScriptBox.");
+    }
+
+    internal static (string? Stack, int? Line) FilterStack(string? stack)
+    {
+        if (string.IsNullOrEmpty(stack))
+        {
+            return (null, null);
+        }
+
+        var frames = stack!
+            .Split('\n')
+            .Select(line => line.TrimEnd('\r'))
+            .Where(line => line.Contains(UserScriptName))
+            .ToList();
+
+        if (frames.Count == 0)
+        {
+            return (null, null);
+        }
+
+        var match = UserFrameLine.Match(frames[0]);
+        int? line = match.Success ? int.Parse(match.Groups[1].Value, System.Globalization.CultureInfo.InvariantCulture) : null;
+        return (string.Join("\n", frames), line);
+    }
+
+    /// <summary>
+    /// State for one execution, shared between the host imports the guest calls.
+    /// </summary>
+    private sealed class Execution
+    {
+        private readonly WasmScriptExecutor _owner;
+        private readonly ScriptSession _session;
+        private readonly Func<SandboxApiDescriptor, object> _resolveInstance;
+        private readonly ExecutionLimits _limits;
+        private readonly CancellationToken _token;
+        private readonly List<ScriptLogEntry> _logs = new();
+        private byte[] _pendingResponse = Array.Empty<byte>();
+        private (string Name, string Message, string Stack)? _error;
+        private int _interrupt;
+        private bool _logsTruncated;
+
+        public Execution(
+            WasmScriptExecutor owner,
+            ScriptSession session,
+            Func<SandboxApiDescriptor, object> resolveInstance,
+            ExecutionLimits limits,
+            CancellationToken token)
+        {
+            _owner = owner;
+            _session = session;
+            _resolveInstance = resolveInstance;
+            _limits = limits;
+            _token = token;
+        }
+
+        public string? ResultJson { get; private set; }
+
+        public int? OversizedResultBytes { get; private set; }
+
+        public IReadOnlyList<ScriptLogEntry> Logs => _logs;
+
+        public bool InterruptRequested => Volatile.Read(ref _interrupt) != 0;
+
+        public void RequestInterrupt() => Volatile.Write(ref _interrupt, 1);
+
+        public ScriptError TakeError(ScriptErrorKind kind)
+        {
+            if (_error is not { } error)
             {
-                memory.Write(outPtr + i, responseBytes[i]);
+                return new ScriptError(ScriptErrorKind.Fault, "SandboxFault", "The script failed without reporting an error.", null, null);
             }
 
-            return bytesToWrite;
-        }
-        catch (Exception)
-        {
-            // System.Console.Error.WriteLine($"[HostCall Error] {ex}");
-            throw; // Re-throw to cause trap
-        }
-    }
-
-    /// <summary>
-    /// Executes the eval_js WASM function and checks for errors.
-    /// </summary>
-    private string ExecuteEvalFunction(Instance instance, Memory memory, string jsCode)
-    {
-        var (ptr, len) = WriteStringToMemory(instance, memory, jsCode);
-
-        var eval = instance.GetFunction<int, int, int>(WasmConfiguration.EvalFunctionName)
-                  ?? throw new InvalidOperationException(
-                      $"{WasmConfiguration.EvalFunctionName} function not found");
-
-        var status = eval(ptr, len);
-
-        if (status != WasmConfiguration.SuccessStatusCode)
-        {
-            var errorMessage = ReadErrorMessage(instance, memory);
-            System.Console.Error.WriteLine($"WASM eval_js status={status}: {errorMessage}");
-            throw new InvalidOperationException(
-                $"eval_js failed with status {status}. Error: {errorMessage}");
-        }
-
-        // Success - read the result
-        return ReadResultMessage(instance, memory);
-    }
-
-    /// <summary>
-    /// Reads the error message from WASM memory after evaluation.
-    /// </summary>
-    private string ReadErrorMessage(Instance instance, Memory memory)
-    {
-        var getErrorPtr = instance.GetFunction<int>(WasmConfiguration.GetErrorPtrFunctionName)
-                         ?? throw new InvalidOperationException(
-                             $"{WasmConfiguration.GetErrorPtrFunctionName} function not found");
-        var getErrorLen = instance.GetFunction<int>(WasmConfiguration.GetErrorLenFunctionName)
-                         ?? throw new InvalidOperationException(
-                             $"{WasmConfiguration.GetErrorLenFunctionName} function not found");
-
-        int errorPtr = getErrorPtr();
-        int errorLen = getErrorLen();
-
-        if (errorLen <= 0)
-        {
-            return string.Empty;
-        }
-
-        return ReadStringFromMemory(memory, errorPtr, errorLen);
-    }
-
-    /// <summary>
-    /// Reads the result value from WASM memory after successful evaluation.
-    /// </summary>
-    private string ReadResultMessage(Instance instance, Memory memory)
-    {
-        var getResultPtr = instance.GetFunction<int>(WasmConfiguration.GetResultPtrFunctionName)
-                          ?? throw new InvalidOperationException(
-                              $"{WasmConfiguration.GetResultPtrFunctionName} function not found");
-        var getResultLen = instance.GetFunction<int>(WasmConfiguration.GetResultLenFunctionName)
-                          ?? throw new InvalidOperationException(
-                              $"{WasmConfiguration.GetResultLenFunctionName} function not found");
-
-        int resultPtr = getResultPtr();
-        int resultLen = getResultLen();
-
-        if (resultLen <= 0)
-        {
-            return string.Empty;
-        }
-
-        return ReadStringFromMemory(memory, resultPtr, resultLen);
-    }
-
-    /// <summary>
-    /// Writes JavaScript source code into WASM linear memory.
-    /// </summary>
-    /// <returns>A tuple of (memory offset, byte length).</returns>
-    private static (int ptr, int len) WriteStringToMemory(Instance instance, Memory memory, string jsCode)
-    {
-        var bytes = Encoding.UTF8.GetBytes(jsCode);
-        var (scriptPtr, maxScriptSize) = GetScriptBufferLocation(instance);
-
-        if (bytes.Length > maxScriptSize)
-        {
-            throw new InvalidOperationException(
-                $"Script too large ({bytes.Length} bytes) for available WASM memory " +
-                $"(max {maxScriptSize} bytes)");
-        }
-
-        for (var i = 0; i < bytes.Length; i++)
-        {
-            memory.Write(scriptPtr + i, bytes[i]);
-        }
-
-        return (scriptPtr, bytes.Length);
-    }
-
-    /// <summary>
-    /// Determines the location and size of the script buffer in WASM memory.
-    /// Prefers dynamic lookup via exported functions, falls back to hardcoded defaults.
-    /// </summary>
-    private static (int ptr, int len) GetScriptBufferLocation(Instance instance)
-    {
-        // Try to get the dynamic script buffer from the WASM module
-        var getScriptBufferPtr = instance.GetFunction<int>(WasmConfiguration.GetScriptBufferPtrFunctionName);
-        var getScriptBufferLen = instance.GetFunction<int>(WasmConfiguration.GetScriptBufferLenFunctionName);
-
-        if (getScriptBufferPtr != null && getScriptBufferLen != null)
-        {
-            return (getScriptBufferPtr(), getScriptBufferLen());
-        }
-
-        // Fallback to hardcoded offset for backward compatibility with older WASM modules
-        return (WasmConfiguration.ScriptMemoryOffset, 
-                WasmConfiguration.MaxScriptSize - WasmConfiguration.ScriptMemoryOffset);
-    }
-
-    private static string ReadStringFromMemory(Memory memory, int ptr, int length)
-    {
-#if NETSTANDARD2_0
-        var buffer = new byte[length];
-        for (var i = 0; i < length; i++)
-        {
-            buffer[i] = memory.Read<byte>(ptr + i);
-        }
-        return Encoding.UTF8.GetString(buffer);
-#else
-        if (length == 0)
-        {
-            return string.Empty;
-        }
-
-        Span<byte> buffer = length <= 1024 ? stackalloc byte[length] : new byte[length];
-        for (var i = 0; i < length; i++)
-        {
-            buffer[i] = memory.Read<byte>(ptr + i);
-        }
-
-        return Encoding.UTF8.GetString(buffer);
-#endif
-    }
-
-    /// <summary>
-    /// Loads configured bootstrap JavaScript files from disk.
-    /// These are prepended before every user script.
-    /// </summary>
-    /// <returns>The bootstrap JavaScript code as a string.</returns>
-    private string LoadStartupJs()
-    {
-        var scripts = _config.StartupScripts ?? new List<string>();
-        if (scripts.Count == 0)
-        {
-            return string.Empty;
-        }
-
-        return BootstrapScriptLoader.LoadScripts(scripts);
-    }
-
-    /// <summary>
-    /// Dispatches a host method call from the sandbox and returns the JSON response.
-    /// </summary>
-    private string HandleHostCall(string json)
-    {
-        try
-        {
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-            if (!root.TryGetProperty("method", out var methodElement))
+            _error = null;
+            if (error.Name == "InternalError" && error.Message == "out of memory")
             {
-                return "{\"error\":\"Host call missing method\"}";
+                kind = ScriptErrorKind.MemoryLimit;
             }
 
-            var method = methodElement.GetString();
-            if (string.IsNullOrWhiteSpace(method))
+            var (stack, line) = FilterStack(error.Stack);
+            return new ScriptError(kind, error.Name, error.Message, stack, line);
+        }
+
+        public void DefineImports(Linker linker, Store store)
+        {
+            linker.Define("host", "call", Function.FromCallback(store, (Caller caller, int ptr, int len) => Call(caller, ptr, len)));
+            linker.Define("host", "take", Function.FromCallback(store, (Caller caller, int ptr, int len) => Take(caller, ptr, len)));
+            linker.Define("host", "log", Function.FromCallback(store, (Caller caller, int level, int ptr, int len) => Log(caller, level, ptr, len)));
+            // Throwing traps the instance. QuickJS's own interrupt raises an error that an async function or a
+            // promise turns into an ordinary rejection, which a script can catch and carry on from.
+            linker.Define("host", "interrupt", Function.FromCallback(store, (Caller _) =>
             {
-                return "{\"error\":\"Host call missing method\"}";
+                ThrowIfStopping();
+                return 0;
+            }));
+            linker.Define("host", "result", Function.FromCallback(store, (Caller caller, int ptr, int len) =>
+            {
+                if (len > _limits.MaxResultBytes)
+                {
+                    OversizedResultBytes = len;
+                    return;
+                }
+
+                ResultJson = len == 0 ? null : ReadString(caller, ptr, len);
+            }));
+            linker.Define("host", "error", Function.FromCallback(store,
+                (Caller caller, int namePtr, int nameLen, int messagePtr, int messageLen, int stackPtr, int stackLen) =>
+                {
+                    _error = (ReadString(caller, namePtr, nameLen), ReadString(caller, messagePtr, messageLen), ReadString(caller, stackPtr, stackLen));
+                }));
+        }
+
+        private void ThrowIfStopping()
+        {
+            if (InterruptRequested)
+            {
+                throw new ExecutionStoppedException();
+            }
+        }
+
+        private int Call(Caller caller, int ptr, int len)
+        {
+            ThrowIfStopping();
+            _pendingResponse = Dispatch(ReadString(caller, ptr, len));
+            return _pendingResponse.Length;
+        }
+
+        private void Take(Caller caller, int ptr, int len)
+        {
+            var memory = caller.GetMemory("memory")!;
+            _pendingResponse.AsSpan(0, len).CopyTo(memory.GetSpan(ptr, len));
+            _pendingResponse = Array.Empty<byte>();
+        }
+
+        private void Log(Caller caller, int level, int ptr, int len)
+        {
+            if (_logs.Count >= _limits.MaxLogEntries)
+            {
+                if (!_logsTruncated)
+                {
+                    _logsTruncated = true;
+                    _logs.Add(new ScriptLogEntry(ScriptLogLevel.Warn, $"Further console output was dropped after {_limits.MaxLogEntries} entries."));
+                }
+                return;
             }
 
-            if (_jsonHandlers.Count > 0 && _jsonHandlers.TryGetValue(method!, out var handler))
+            // A UTF-8 character is at most four bytes, so this is enough for the part that is kept.
+            var message = ReadString(caller, ptr, Math.Min(len, _limits.MaxLogEntryLength * 4));
+            if (message.Length > _limits.MaxLogEntryLength)
             {
-                var context = HostCallContext.FromJson(method!, root, CancellationToken.None);
+                message = message.Substring(0, _limits.MaxLogEntryLength) + $"... [{message.Length - _limits.MaxLogEntryLength} more characters]";
+            }
+
+            var logLevel = level is >= 0 and <= 3 ? (ScriptLogLevel)level : ScriptLogLevel.Log;
+            _logs.Add(new ScriptLogEntry(logLevel, message));
+        }
+
+        private byte[] Dispatch(string payload)
+        {
+            string method;
+            JsonElement[] arguments;
+            try
+            {
+                using var document = JsonDocument.Parse(payload);
+                var root = document.RootElement;
+                method = root.GetProperty("method").GetString() ?? string.Empty;
+                arguments = root.TryGetProperty("args", out var args) && args.ValueKind == JsonValueKind.Array
+                    ? args.EnumerateArray().Select(a => a.Clone()).ToArray()
+                    : Array.Empty<JsonElement>();
+            }
+            catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException)
+            {
+                return ErrorResponse("HostError", "Malformed host call: " + ex.Message);
+            }
+
+            if (!_owner._handlers.TryGetValue(method, out var handler))
+            {
+                return ErrorResponse("TypeError", $"'{method}' is not a host API method.");
+            }
+
+            var context = new HostCallContext(method, arguments, _session, _owner._jsonOptions, _resolveInstance, _token);
+            try
+            {
                 var result = handler(context).GetAwaiter().GetResult();
-                var response = JsonSerializer.Serialize(new { result }, _jsonOptions);
-                return response;
+                return ResultResponse(result);
+            }
+            catch (OperationCanceledException) when (InterruptRequested)
+            {
+                throw new ExecutionStoppedException();
+            }
+            catch (Exception ex)
+            {
+                return ExceptionResponse(ex);
+            }
+        }
+
+        private byte[] ResultResponse(HostCallResult result)
+        {
+            using var buffer = new MemoryStream();
+            using (var writer = new Utf8JsonWriter(buffer))
+            {
+                writer.WriteStartObject();
+                writer.WritePropertyName("result");
+                if (result.Value is null)
+                {
+                    writer.WriteNullValue();
+                }
+                else
+                {
+                    var type = result.DeclaredType == typeof(object) || result.DeclaredType == typeof(void)
+                        ? result.Value.GetType()
+                        : result.DeclaredType;
+                    JsonSerializer.Serialize(writer, result.Value, type, _owner._jsonOptions);
+                }
+                writer.WriteEndObject();
             }
 
-            if (!root.TryGetProperty("args", out var args))
+            return buffer.ToArray();
+        }
+
+        private static byte[] ExceptionResponse(Exception ex)
+        {
+            while (ex is AggregateException { InnerException: { } inner })
             {
-                return $"{{\"error\":\"Host call '{method}' missing args array\"}}";
+                ex = inner;
             }
 
-            return method switch
+            return ex switch
             {
-                "Log" => HandleLogCall(args),
-                "Add" => HandleAddCall(args),
-                "Subtract" => HandleSubtractCall(args),
-
-                // File System API
-                "FileSystemReadFile" => HandleFileSystemReadFileCall(args),
-                "FileSystemWriteFile" => HandleFileSystemWriteFileCall(args),
-                "FileSystemListFiles" => HandleFileSystemListFilesCall(args),
-                "FileSystemExists" => HandleFileSystemExistsCall(args),
-                "FileSystemDelete" => HandleFileSystemDeleteCall(args),
-                "FileSystemCreateDirectory" => HandleFileSystemCreateDirectoryCall(args),
-
-                // HTTP Client API
-                "HttpGet" => HandleHttpGetCall(args),
-                "HttpPost" => HandleHttpPostCall(args),
-                "HttpRequest" => HandleHttpRequestCall(args),
-                
-                // Tool Invocation Protocol
-                "tool.invoke" => HandleToolInvoke(args),
-
-                _ => $"{{\"error\":\"Unknown method: {method}\"}}"
+                ScriptApiException api => ErrorResponse(api.ErrorName, api.Message),
+                OperationCanceledException => ErrorResponse("AbortError", "The host call was cancelled."),
+                _ => ErrorResponse("HostError", ex.Message),
             };
         }
-        catch (Exception ex)
-        {
-            return $"{{\"error\":\"Error processing host call: {ex.Message}\"}}";
-        }
-    }
 
-    /// <summary>
-    /// Handles the tool.invoke host call from the sandbox.
-    /// This is used by the bootstrap-utils.ts proxy to invoke tools dynamically.
-    /// </summary>
-    private string HandleToolInvoke(JsonElement args)
-    {
-        // args[0] is the JSON string of the request
-        var requestJson = args[0].GetString();
-        if (string.IsNullOrEmpty(requestJson))
+        private static byte[] ErrorResponse(string name, string message)
         {
-             return "{\"error\":\"Missing request JSON\"}";
+            return JsonSerializer.SerializeToUtf8Bytes(new Dictionary<string, object>
+            {
+                ["error"] = new Dictionary<string, string> { ["name"] = name, ["message"] = message },
+            });
         }
 
-        using var doc = JsonDocument.Parse(requestJson);
-        var root = doc.RootElement;
-        
-        if (!root.TryGetProperty("toolId", out var toolIdElement))
+        private static string ReadString(Caller caller, int ptr, int len)
         {
-            return "{\"error\":\"Missing toolId\"}";
-        }
-        
-        var toolId = toolIdElement.GetString();
-        if (string.IsNullOrEmpty(toolId))
-        {
-            return "{\"error\":\"Empty toolId\"}";
-        }
+            if (len <= 0)
+            {
+                return string.Empty;
+            }
 
-        if (_jsonHandlers.TryGetValue(toolId!, out var handler))
-        {
-             // HostCallContext.FromJson expects an object with "args" property, 
-             // which matches the ToolInvocationRequest structure.
-             var context = HostCallContext.FromJson(toolId!, root, CancellationToken.None);
-             var result = handler(context).GetAwaiter().GetResult();
-             return JsonSerializer.Serialize(new { result }, _jsonOptions);
-        }
-        
-        return $"{{\"error\":\"Unknown tool: {toolId}\"}}";
-    }
-
-    /// <summary>
-    /// Handles the Log host call from the sandbox.
-    /// </summary>
-    private string HandleLogCall(JsonElement args)
-    {
-        var message = args[0].GetString();
-        _hostApi.Log(message!);
-        return "{\"result\":null}";
-    }
-
-    /// <summary>
-    /// Handles the Add host call from the sandbox.
-    /// </summary>
-    private string HandleAddCall(JsonElement args)
-    {
-        var a = args[0].GetInt32();
-        var b = args[1].GetInt32();
-        var sum = _hostApi.Add(a, b);
-        return $"{{\"result\":{sum}}}";
-    }
-
-    /// <summary>
-    /// Handles the Subtract host call from the sandbox.
-    /// </summary>
-    private string HandleSubtractCall(JsonElement args)
-    {
-        var a = args[0].GetInt32();
-        var b = args[1].GetInt32();
-        var difference = _hostApi.Subtract(a, b);
-        return $"{{\"result\":{difference}}}";
-    }
-
-    #region File System API Handlers
-
-    /// <summary>
-    /// Handles the FileSystemReadFile host call from the sandbox.
-    /// </summary>
-    private string HandleFileSystemReadFileCall(JsonElement args)
-    {
-        var path = args[0].GetString() ?? throw new ArgumentException("path is required");
-        var content = _hostApi.FileSystemReadFile(path);
-        return JsonSerializer.Serialize(new { result = content });
-    }
-
-    /// <summary>
-    /// Handles the FileSystemWriteFile host call from the sandbox.
-    /// </summary>
-    private string HandleFileSystemWriteFileCall(JsonElement args)
-    {
-        var path = args[0].GetString() ?? throw new ArgumentException("path is required");
-        var content = args[1].GetString() ?? throw new ArgumentException("content is required");
-        _hostApi.FileSystemWriteFile(path, content);
-        return "{\"result\":null}";
-    }
-
-    /// <summary>
-    /// Handles the FileSystemListFiles host call from the sandbox.
-    /// </summary>
-    private string HandleFileSystemListFilesCall(JsonElement args)
-    {
-        var path = args[0].GetString() ?? throw new ArgumentException("path is required");
-        var filesJson = _hostApi.FileSystemListFiles(path);
-        return $"{{\"result\":{filesJson}}}";
-    }
-
-    /// <summary>
-    /// Handles the FileSystemExists host call from the sandbox.
-    /// </summary>
-    private string HandleFileSystemExistsCall(JsonElement args)
-    {
-        var path = args[0].GetString() ?? throw new ArgumentException("path is required");
-        var exists = _hostApi.FileSystemExists(path);
-        return $"{{\"result\":{exists.ToString().ToLowerInvariant()}}}";
-    }
-
-    /// <summary>
-    /// Handles the FileSystemDelete host call from the sandbox.
-    /// </summary>
-    private string HandleFileSystemDeleteCall(JsonElement args)
-    {
-        var path = args[0].GetString() ?? throw new ArgumentException("path is required");
-        _hostApi.FileSystemDelete(path);
-        return "{\"result\":null}";
-    }
-
-    /// <summary>
-    /// Handles the FileSystemCreateDirectory host call from the sandbox.
-    /// </summary>
-    private string HandleFileSystemCreateDirectoryCall(JsonElement args)
-    {
-        var path = args[0].GetString() ?? throw new ArgumentException("path is required");
-        _hostApi.FileSystemCreateDirectory(path);
-        return "{\"result\":null}";
-    }
-
-    #endregion
-
-    #region HTTP Client API Handlers
-
-    /// <summary>
-    /// Handles the HttpGet host call from the sandbox.
-    /// </summary>
-    private string HandleHttpGetCall(JsonElement args)
-    {
-        var url = args[0].GetString() ?? throw new ArgumentException("url is required");
-        var responseBody = _hostApi.HttpGet(url);
-        return JsonSerializer.Serialize(new { result = responseBody });
-    }
-
-    /// <summary>
-    /// Handles the HttpPost host call from the sandbox.
-    /// </summary>
-    private string HandleHttpPostCall(JsonElement args)
-    {
-        var url = args[0].GetString() ?? throw new ArgumentException("url is required");
-        var dataJson = args[1].GetString() ?? "{}";
-        var responseBody = _hostApi.HttpPost(url, dataJson);
-        return JsonSerializer.Serialize(new { result = responseBody });
-    }
-
-    /// <summary>
-    /// Handles the HttpRequest host call from the sandbox.
-    /// </summary>
-    private string HandleHttpRequestCall(JsonElement args)
-    {
-        var optionsJson = args[0].GetString() ?? throw new ArgumentException("options is required");
-        var responseJson = _hostApi.HttpRequest(optionsJson);
-        return $"{{\"result\":{responseJson}}}";
-    }
-
-    #endregion
-#if NET6_0_OR_GREATER
-    public ValueTask DisposeAsync()
-    {
-        if (_disposed)
-        {
-            return default(ValueTask);
-        }
-
-        _module.Dispose();
-        _engine.Dispose();
-        _disposed = true;
-        return default(ValueTask);
-    }
+            var memory = caller.GetMemory("memory")!;
+#if NETSTANDARD2_0
+            return Encoding.UTF8.GetString(memory.GetSpan(ptr, len).ToArray());
 #else
-    public void Dispose()
-    {
-        if (_disposed)
-        {
-            return;
-        }
-
-        _module.Dispose();
-        _engine.Dispose();
-        _disposed = true;
-    }
+            return Encoding.UTF8.GetString(memory.GetSpan(ptr, len));
 #endif
+        }
+    }
 }

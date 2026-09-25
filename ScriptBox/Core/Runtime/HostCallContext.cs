@@ -1,92 +1,44 @@
-using System;
-using System.Collections.Generic;
 using System.Text.Json;
 using System.Threading;
 
 namespace ScriptBox.Core.Runtime;
 
 /// <summary>
-/// Provides strongly-typed access to host call payloads originating from the WASM sandbox.
+/// One call from a script into a host API. A host method can take this as a
+/// parameter, or a <see cref="CancellationToken"/>, alongside its arguments.
 /// </summary>
-internal sealed class HostCallContext
+public sealed class HostCallContext
 {
-    private HostCallContext(
+    private readonly Func<SandboxApiDescriptor, object> _resolveInstance;
+
+    internal HostCallContext(
         string method,
-        IReadOnlyList<object?> arguments,
-        IReadOnlyDictionary<string, object?> parameters,
+        IReadOnlyList<JsonElement> arguments,
+        ScriptSession session,
+        JsonSerializerOptions jsonOptions,
+        Func<SandboxApiDescriptor, object> resolveInstance,
         CancellationToken cancellationToken)
     {
         Method = method;
         Arguments = arguments;
-        Params = parameters;
+        Session = session;
+        JsonOptions = jsonOptions;
+        _resolveInstance = resolveInstance;
         CancellationToken = cancellationToken;
     }
 
+    /// <summary>The called method as the script names it, e.g. <c>tasks.get</c>.</summary>
     public string Method { get; }
-    public IReadOnlyList<object?> Arguments { get; }
-    public IReadOnlyList<object?> Args => Arguments;
-    public IReadOnlyDictionary<string, object?> Params { get; }
+
+    /// <summary>The arguments as the script passed them. An undefined argument arrives as JSON null.</summary>
+    public IReadOnlyList<JsonElement> Arguments { get; }
+
+    public ScriptSession Session { get; }
+
+    public JsonSerializerOptions JsonOptions { get; }
+
+    /// <summary>Signalled when the script times out or the caller cancels the execution.</summary>
     public CancellationToken CancellationToken { get; }
 
-    internal static HostCallContext FromJson(
-        string method,
-        JsonElement root,
-        CancellationToken cancellationToken)
-    {
-        IReadOnlyList<object?> args = Array.Empty<object?>();
-        if (root.TryGetProperty("args", out var argsElement) &&
-            argsElement.ValueKind == JsonValueKind.Array)
-        {
-            args = ConvertArray(argsElement);
-        }
-
-        var parameters = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-        if (root.TryGetProperty("params", out var paramsElement) &&
-            paramsElement.ValueKind == JsonValueKind.Object)
-        {
-            parameters = ConvertObject(paramsElement);
-        }
-
-        return new HostCallContext(method, args, parameters, cancellationToken);
-    }
-
-    private static object? ConvertValue(JsonElement element)
-    {
-        return element.ValueKind switch
-        {
-            JsonValueKind.String => element.GetString(),
-            JsonValueKind.Number => element.TryGetInt64(out var l)
-                ? l
-                : element.TryGetDouble(out var dbl)
-                    ? dbl
-                    : element.GetRawText(),
-            JsonValueKind.True => true,
-            JsonValueKind.False => false,
-            JsonValueKind.Null => null,
-            JsonValueKind.Object => ConvertObject(element),
-            JsonValueKind.Array => ConvertArray(element),
-            _ => element.GetRawText()
-        };
-    }
-
-    private static IReadOnlyList<object?> ConvertArray(JsonElement element)
-    {
-        var list = new List<object?>();
-        foreach (var item in element.EnumerateArray())
-        {
-            list.Add(ConvertValue(item));
-        }
-        return list;
-    }
-
-    private static Dictionary<string, object?> ConvertObject(JsonElement element)
-    {
-        var dict = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
-        foreach (var prop in element.EnumerateObject())
-        {
-            dict[prop.Name] = ConvertValue(prop.Value);
-        }
-
-        return dict;
-    }
+    internal object ResolveInstance(SandboxApiDescriptor api) => _resolveInstance(api);
 }

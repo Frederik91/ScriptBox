@@ -1,571 +1,335 @@
 #include "quickjs.h"
+#include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include <stdarg.h>
-
-#define NULL_LITERAL_SIZE 5  // "null" + trailing '\0'
-static const char LITERAL_NULL[] = "null";
 
 // ============================================================================
-// QuickJS WASM ScriptBox Bridge - Error Handling and Evaluation Infrastructure
-// ============================================================================
+// ScriptBox guest: QuickJS behind a small host ABI with no size limits.
 //
-// This module provides:
-// - Error message capture and reporting
-// - Safe JavaScript evaluation with buffer management
-// - Diagnostic functions for troubleshooting
+// One WASM instance serves one execution. The host calls, in order:
+//   sb_init()                          create the runtime and install the bridge
+//   sb_alloc(n) + sb_eval(..., 0)      evaluate each bootstrap script
+//   sb_alloc(n) + sb_eval(..., 1)      evaluate the user script and report it
 //
+// Nothing crosses the boundary through a fixed buffer. Payloads going to the
+// host are passed as (ptr, len) into guest memory. A host response is fetched
+// in two steps because only the host knows its length: host.call returns the
+// length, the guest allocates that much, and host.take copies it in.
 // ============================================================================
-
-// ---------- Host import ----------
 
 __attribute__((import_module("host"), import_name("call")))
-int host_call(const char* in_ptr, int in_len,
-              char* out_ptr, int out_cap);
+int host_call(const char* in_ptr, int in_len);
+
+__attribute__((import_module("host"), import_name("take")))
+void host_take(char* out_ptr, int out_len);
 
 __attribute__((import_module("host"), import_name("log")))
-void host_log(const char* ptr, int len);
+void host_log(int level, const char* ptr, int len);
 
-// ---------- Error reporting infrastructure ----------
+__attribute__((import_module("host"), import_name("interrupt")))
+int host_interrupt(void);
 
-// Global error message buffer for inter-process communication
-// Accessible from host via get_last_error_ptr() and get_last_error_len()
-static char g_last_error[1024];
+__attribute__((import_module("host"), import_name("result")))
+void host_result(const char* ptr, int len);
 
-// Global result buffer for returning JavaScript values to the host
-// Accessible from host via get_result_ptr() and get_result_len()
-static char g_result[65536];  // 64KB buffer for result values
+__attribute__((import_module("host"), import_name("error")))
+void host_error(const char* name_ptr, int name_len,
+                const char* message_ptr, int message_len,
+                const char* stack_ptr, int stack_len);
 
-// Global script buffer for receiving JavaScript source code from the host
-// Accessible from host via get_script_buffer_ptr() and get_script_buffer_len()
-#define SCRIPT_BUFFER_SIZE (1024 * 1024) // 1MB
-static char g_script_buffer[SCRIPT_BUFFER_SIZE];
+#define SB_OK 0
+#define SB_SCRIPT_ERROR 1   // details were sent through host.error
+#define SB_NOT_INITIALIZED 2
+#define SB_OUT_OF_MEMORY 3
 
-// ---------- Global QuickJS state ----------
-// Note: Each eval_js call creates its own runtime/context for isolation
+// QuickJS measures recursion on the shadow stack in linear memory (8 MB, set
+// in build.sh), but each JS frame also uses several times as much of the
+// native stack Wasmtime runs on, which it cannot see. 1 MB keeps QuickJS's
+// catchable "stack overflow" error ahead of the native limit (WasmRuntime.MaxWasmStackSize).
+#define SB_JS_STACK_SIZE (1024 * 1024)
 
-// ---------- Error message handling ----------
-//
-// The error buffer is used to communicate detailed error information back to
-// the host process after evaluation fails. This is critical for debugging.
+static JSRuntime* g_rt = NULL;
+static JSContext* g_ctx = NULL;
 
-/**
- * @brief Set error message in global buffer
- * @param fmt Format string (printf-style)
- */
-static void set_error(const char* fmt, ...) {
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(g_last_error, sizeof(g_last_error), fmt, args);
-    va_end(args);
+__attribute__((export_name("sb_alloc")))
+void* sb_alloc(int size) {
+    return malloc(size > 0 ? (size_t)size : 1);
 }
 
-/**
- * @brief Extract and format a QuickJS exception into the error buffer
- * @param ctx The QuickJS context
- * @param exc The exception value from JS_GetException()
- */
-static void capture_exception(JSContext* ctx, JSValue exc) {
-    const char* msg = JS_ToCString(ctx, exc);
-    
-    if (msg) {
-        set_error("Exception: %s", msg);
-        JS_FreeCString(ctx, msg);
-    } else {
-        // Exception object (not directly stringifiable) - try to extract message property
-        JSValue msgProp = JS_GetPropertyStr(ctx, exc, "message");
-        const char* msgStr = JS_ToCString(ctx, msgProp);
-        
-        if (msgStr) {
-            set_error("Exception: %s", msgStr);
-            JS_FreeCString(ctx, msgStr);
-        } else {
-            set_error("Exception: (unable to extract message)");
-        }
-        JS_FreeValue(ctx, msgProp);
-    }
-    
-    // Append stack trace if available
-    JSValue stackVal = JS_GetPropertyStr(ctx, exc, "stack");
-    if (!JS_IsUndefined(stackVal)) {
-        const char* stackStr = JS_ToCString(ctx, stackVal);
-        if (stackStr) {
-            size_t cur = strlen(g_last_error);
-            snprintf(g_last_error + cur, sizeof(g_last_error) - cur,
-                     "\nStack: %s", stackStr);
-            JS_FreeCString(ctx, stackStr);
-        }
-    }
-    JS_FreeValue(ctx, stackVal);
+__attribute__((export_name("sb_free")))
+void sb_free(void* ptr) {
+    free(ptr);
 }
-
-// ---------- JS <-> host_call bridge ----------
-
-// JS signature: __host.bridge(payload: string): string | null
-// This function bridges JavaScript calls to the host via the WASM import.
-// It accepts a JSON string, forwards it to the host, and returns the host's response.
-static JSValue js_bridge_call(JSContext *ctx, JSValueConst this_val,
-                               int argc, JSValueConst *argv)
-{
-    // Validate argument count
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "bridge requires 1 argument (JSON string)");
-    }
-    
-    // Extract the JSON payload from the first argument
-    size_t payload_len;
-    const char* payload = JS_ToCStringLen(ctx, &payload_len, argv[0]);
-    if (!payload) {
-        return JS_ThrowTypeError(ctx, "bridge argument must be a string");
-    }
-    
-    // Prepare output buffer for host response
-    // Using a reasonable fixed size; could be made dynamic if needed
-    char response_buf[4096];
-    
-    // Call the host via WASM import
-    // host_call(input_ptr, input_len, output_ptr, output_capacity)
-    int response_len = host_call(payload, (int)payload_len, response_buf, sizeof(response_buf));
-    
-    // Clean up the input string
-    JS_FreeCString(ctx, payload);
-    
-    // Handle host call errors
-    if (response_len < 0) {
-        return JS_ThrowInternalError(ctx, "Host call failed with error code %d", response_len);
-    }
-    
-    if (response_len == 0) {
-        // Host returned empty response - return null
-        return JS_NULL;
-    }
-    
-    // Return the host's response as a JavaScript string
-    return JS_NewStringLen(ctx, response_buf, response_len);
-}
-
-// Note: Host bridge is installed per-evaluation in eval_js()
 
 // ---------- Error reporting ----------
 
-/**
- * @brief Get pointer to script buffer
- * @return Pointer to the script buffer
- */
-__attribute__((export_name("get_script_buffer_ptr")))
-char* get_script_buffer_ptr(void) {
-    return g_script_buffer;
+static void report_c_error(const char* name, const char* message) {
+    host_error(name, (int)strlen(name), message, (int)strlen(message), "", 0);
 }
 
-/**
- * @brief Get length of script buffer
- * @return Length in bytes
- */
-__attribute__((export_name("get_script_buffer_len")))
-int get_script_buffer_len(void) {
-    return SCRIPT_BUFFER_SIZE;
+static const char* get_string_property(JSContext* ctx, JSValueConst obj, const char* prop, size_t* len) {
+    JSValue value = JS_GetPropertyStr(ctx, obj, prop);
+    const char* str = NULL;
+    if (!JS_IsUndefined(value) && !JS_IsNull(value)) {
+        str = JS_ToCStringLen(ctx, len, value);
+    }
+    JS_FreeValue(ctx, value);
+    return str;
 }
 
-/**
- * @brief Get pointer to error message buffer
- * @return Pointer to null-terminated error string (valid until next eval_js call)
- * 
- * The returned pointer points to WASM linear memory and is valid for the
- * lifetime of the current WASM instance. Use get_last_error_len() to determine
- * the length before copying.
- */
-__attribute__((export_name("get_last_error_ptr")))
-const char* get_last_error_ptr(void) {
-    return g_last_error;
+// An Error contributes its name, message and stack. Any other thrown value
+// (`throw "text"`) is reported by its string form as the message.
+static void report_exception(JSContext* ctx, JSValueConst exc) {
+    size_t name_len = 0, message_len = 0, stack_len = 0;
+    const char* name = NULL;
+    const char* message = NULL;
+    const char* stack = NULL;
+
+    if (JS_IsError(ctx, exc)) {
+        name = get_string_property(ctx, exc, "name", &name_len);
+        message = get_string_property(ctx, exc, "message", &message_len);
+        stack = get_string_property(ctx, exc, "stack", &stack_len);
+    } else {
+        message = JS_ToCStringLen(ctx, &message_len, exc);
+    }
+
+    host_error(name ? name : "", (int)name_len,
+               message ? message : "", (int)message_len,
+               stack ? stack : "", (int)stack_len);
+
+    if (name) JS_FreeCString(ctx, name);
+    if (message) JS_FreeCString(ctx, message);
+    if (stack) JS_FreeCString(ctx, stack);
 }
 
-/**
- * @brief Get length of error message
- * @return Length in bytes (not including null terminator)
- */
-__attribute__((export_name("get_last_error_len")))
-int get_last_error_len(void) {
-    return (int)strlen(g_last_error);
+static void report_pending_exception(JSContext* ctx) {
+    JSValue exc = JS_GetException(ctx);
+    report_exception(ctx, exc);
+    JS_FreeValue(ctx, exc);
 }
 
-/**
- * @brief Get pointer to result buffer
- * @return Pointer to null-terminated result string (valid until next eval_js call)
- *
- * The returned pointer points to WASM linear memory and is valid for the
- * lifetime of the current WASM instance. Use get_result_len() to determine
- * the length before copying.
- */
-__attribute__((export_name("get_result_ptr")))
-const char* get_result_ptr(void) {
-    return g_result;
-}
+// ---------- Bridge functions, exposed to JavaScript as __host.* ----------
 
-/**
- * @brief Get length of result
- * @return Length in bytes (not including null terminator)
- */
-__attribute__((export_name("get_result_len")))
-int get_result_len(void) {
-    return (int)strlen(g_result);
-}
+// __host.call(payload: string): string
+static JSValue js_host_call(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    if (argc < 1) {
+        return JS_ThrowTypeError(ctx, "__host.call requires a JSON string");
+    }
 
-// ---------- Console logging ----------
-
-static JSValue js_console_log(JSContext *ctx, JSValueConst this_val,
-                              int argc, JSValueConst *argv)
-{
-    size_t len = 0;
-    const char* str = JS_ToCStringLen(ctx, &len, argv[0]);
-    if (!str)
+    size_t payload_len;
+    const char* payload = JS_ToCStringLen(ctx, &payload_len, argv[0]);
+    if (!payload) {
         return JS_EXCEPTION;
+    }
 
-    host_log(str, (int)len);
-    JS_FreeCString(ctx, str);
+    int response_len = host_call(payload, (int)payload_len);
+    JS_FreeCString(ctx, payload);
+
+    if (response_len < 0) {
+        return JS_ThrowInternalError(ctx, "Host call failed");
+    }
+
+    char* response = malloc((size_t)response_len + 1);
+    if (!response) {
+        return JS_ThrowOutOfMemory(ctx);
+    }
+
+    host_take(response, response_len);
+    JSValue result = JS_NewStringLen(ctx, response, (size_t)response_len);
+    free(response);
+    return result;
+}
+
+// __host.log(level: number, message: string): void
+static JSValue js_host_log(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
+    int level = 0;
+    if (argc < 2 || JS_ToInt32(ctx, &level, argv[0]) != 0) {
+        return JS_ThrowTypeError(ctx, "__host.log requires a level and a message");
+    }
+
+    size_t len;
+    const char* message = JS_ToCStringLen(ctx, &len, argv[1]);
+    if (!message) {
+        return JS_EXCEPTION;
+    }
+
+    host_log(level, message, (int)len);
+    JS_FreeCString(ctx, message);
     return JS_UNDEFINED;
 }
 
-// ---------- Host bridge installation ----------
-
-// Install host bridge (console.log, __host.bridge) into the JS context.
-// This provides the minimal, stable bridge primitives.
-// Higher-level APIs (scriptbox, etc.) are injected as JS by the host.
-static int install_host_bridge(JSContext* ctx) {
+static int install_bridge(JSContext* ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
-    if (JS_IsUndefined(global) || JS_IsNull(global)) {
+    JSValue host = JS_NewObject(ctx);
+    if (JS_IsException(host)) {
         JS_FreeValue(ctx, global);
-        set_error("Global object is null/undefined - context initialization failed");
         return -1;
     }
 
-    // -------- Install console.log --------
-    JSValue console = JS_NewObject(ctx);
-    if (JS_IsException(console)) {
-        JS_FreeValue(ctx, global);
-        set_error("Failed to create console object");
-        return -1;
-    }
-
-    JSValue logFn = JS_NewCFunction(ctx, js_console_log, "log", 1);
-    if (JS_IsException(logFn)) {
-        JS_FreeValue(ctx, console);
-        JS_FreeValue(ctx, global);
-        set_error("Failed to create console.log function");
-        return -1;
-    }
-    JS_SetPropertyStr(ctx, console, "log", logFn);
-    JS_SetPropertyStr(ctx, global, "console", console);
-
-    // -------- Install __host object with functions --------
-    JSValue hostObj = JS_NewObject(ctx);
-    if (JS_IsException(hostObj)) {
-        JS_FreeValue(ctx, global);
-        set_error("Failed to create __host object");
-        return -1;
-    }
-    
-    // Register bridge function for host communication
-    JSValue bridgeFn = JS_NewCFunction(ctx, js_bridge_call, "bridge", 1);
-    if (JS_IsException(bridgeFn)) {
-        JS_FreeValue(ctx, hostObj);
-        JS_FreeValue(ctx, global);
-        set_error("Failed to create bridge function");
-        return -1;
-    }
-    JS_SetPropertyStr(ctx, hostObj, "bridge", bridgeFn);
-    
-    // Attach __host to global
-    JS_SetPropertyStr(ctx, global, "__host", hostObj);
+    JS_SetPropertyStr(ctx, host, "call", JS_NewCFunction(ctx, js_host_call, "call", 1));
+    JS_SetPropertyStr(ctx, host, "log", JS_NewCFunction(ctx, js_host_log, "log", 2));
+    JS_SetPropertyStr(ctx, global, "__host", host);
     JS_FreeValue(ctx, global);
-    
     return 0;
 }
 
-// ---------- Result Conversion ----------
+// QuickJS polls this while running bytecode. The host stops a script by
+// throwing from host.interrupt, which traps the instance. It never returns
+// non-zero: QuickJS's own "interrupted" error becomes an ordinary rejection
+// inside an async function, which a script could catch and carry on from.
+static int interrupt_handler(JSRuntime* rt, void* opaque) {
+    return host_interrupt();
+}
 
-/**
- * @brief Convert a JavaScript value to a string representation
- *
- * For primitives (number, boolean, string, null, undefined): uses ToString
- * For objects and arrays: uses JSON.stringify
- *
- * @param ctx The QuickJS context
- * @param val The JavaScript value to convert
- * @param result_buf Output buffer for the result
- * @param result_buf_size Size of the output buffer
- * @return 0 on success, -1 on error
- */
-static int js_value_to_string(JSContext* ctx, JSValue val, char* result_buf, size_t result_buf_size) {
-    // Clear result buffer
-    result_buf[0] = '\0';
+// ---------- Exports ----------
 
-    // Handle different value types
-    if (JS_IsUndefined(val)) {
-        snprintf(result_buf, result_buf_size, "undefined");
-        return 0;
+__attribute__((export_name("sb_init")))
+int sb_init(void) {
+    if (g_ctx) {
+        return SB_OK;
     }
 
-    if (JS_IsNull(val)) {
-        // Write the literal ourselves so QuickJS doesn't accidentally emit the
-        // bootstrap script text (this happened when we relied on snprintf).
-        if (result_buf_size >= NULL_LITERAL_SIZE) {
-            for (size_t i = 0; i < NULL_LITERAL_SIZE; i++) {
-                result_buf[i] = LITERAL_NULL[i];
-            }
-        } else if (result_buf_size > 0) {
-            size_t copy_len = result_buf_size - 1;
-            size_t i;
-            for (i = 0; i < copy_len && LITERAL_NULL[i] != '\0'; i++) {
-                result_buf[i] = LITERAL_NULL[i];
-            }
-            result_buf[i] = '\0';
-        }
-        return 0;
+    g_rt = JS_NewRuntime();
+    if (!g_rt) {
+        report_c_error("InternalError", "Failed to create the JavaScript runtime");
+        return SB_OUT_OF_MEMORY;
     }
 
-    if (JS_IsBool(val)) {
-        int bval = JS_ToBool(ctx, val);
-        snprintf(result_buf, result_buf_size, "%s", bval ? "true" : "false");
-        return 0;
+    JS_SetMaxStackSize(g_rt, SB_JS_STACK_SIZE);
+    JS_SetInterruptHandler(g_rt, interrupt_handler, NULL);
+
+    g_ctx = JS_NewContext(g_rt);
+    if (!g_ctx) {
+        report_c_error("InternalError", "Failed to create the JavaScript context");
+        JS_FreeRuntime(g_rt);
+        g_rt = NULL;
+        return SB_OUT_OF_MEMORY;
     }
 
-    if (JS_IsNumber(val) || JS_IsString(val)) {
-        // For numbers and strings, use direct ToString
-        const char* str = JS_ToCString(ctx, val);
-        if (!str) {
-            set_error("Failed to convert value to string");
-            return -1;
-        }
-        snprintf(result_buf, result_buf_size, "%s", str);
-        JS_FreeCString(ctx, str);
-        return 0;
+    if (install_bridge(g_ctx) != 0) {
+        report_c_error("InternalError", "Failed to install the host bridge");
+        return SB_OUT_OF_MEMORY;
     }
 
-    // For objects and arrays, use JSON.stringify
-    if (JS_IsObject(val)) {
-        // Get JSON global object
-        JSValue global = JS_GetGlobalObject(ctx);
-        JSValue json_obj = JS_GetPropertyStr(ctx, global, "JSON");
-        JSValue stringify_fn = JS_GetPropertyStr(ctx, json_obj, "stringify");
+    return SB_OK;
+}
 
-        // Call JSON.stringify(val)
-        JSValue args[1] = { val };
-        JSValue json_result = JS_Call(ctx, stringify_fn, json_obj, 1, args);
-
-        if (JS_IsException(json_result)) {
-            // JSON.stringify failed - try toString as fallback
-            JS_FreeValue(ctx, json_result);
-            JS_FreeValue(ctx, stringify_fn);
-            JS_FreeValue(ctx, json_obj);
-            JS_FreeValue(ctx, global);
-
-            const char* str = JS_ToCString(ctx, val);
-            if (!str) {
-                set_error("Failed to convert object to string");
-                return -1;
-            }
-            snprintf(result_buf, result_buf_size, "%s", str);
-            JS_FreeCString(ctx, str);
+// Runs queued promise jobs until none are left. Returns 0, or -1 after
+// reporting an exception thrown by a job.
+static int drain_jobs(void) {
+    JSContext* job_ctx;
+    for (;;) {
+        int status = JS_ExecutePendingJob(g_rt, &job_ctx);
+        if (status == 0) {
             return 0;
         }
-
-        const char* json_str = JS_ToCString(ctx, json_result);
-        if (!json_str) {
-            JS_FreeValue(ctx, json_result);
-            JS_FreeValue(ctx, stringify_fn);
-            JS_FreeValue(ctx, json_obj);
-            JS_FreeValue(ctx, global);
-            set_error("Failed to convert JSON result to string");
+        if (status < 0) {
+            report_pending_exception(job_ctx);
             return -1;
         }
+    }
+}
 
-        snprintf(result_buf, result_buf_size, "%s", json_str);
-
-        JS_FreeCString(ctx, json_str);
-        JS_FreeValue(ctx, json_result);
-        JS_FreeValue(ctx, stringify_fn);
-        JS_FreeValue(ctx, json_obj);
-        JS_FreeValue(ctx, global);
-        return 0;
+// undefined, functions and symbols have no JSON form; they are reported as an
+// empty result, which the host reads as "no value".
+static int report_value(JSValueConst value) {
+    JSValue json = JS_JSONStringify(g_ctx, value, JS_UNDEFINED, JS_UNDEFINED);
+    if (JS_IsException(json)) {
+        report_pending_exception(g_ctx);
+        return SB_SCRIPT_ERROR;
     }
 
-    // Fallback: try to convert to string
-    const char* str = JS_ToCString(ctx, val);
+    if (JS_IsUndefined(json)) {
+        host_result("", 0);
+        return SB_OK;
+    }
+
+    size_t len;
+    const char* str = JS_ToCStringLen(g_ctx, &len, json);
+    JS_FreeValue(g_ctx, json);
     if (!str) {
-        set_error("Failed to convert value to string");
-        return -1;
+        report_pending_exception(g_ctx);
+        return SB_SCRIPT_ERROR;
     }
-    snprintf(result_buf, result_buf_size, "%s", str);
-    JS_FreeCString(ctx, str);
-    return 0;
+
+    host_result(str, (int)len);
+    JS_FreeCString(g_ctx, str);
+    return SB_OK;
 }
 
-// ---------- JavaScript Evaluation ----------
-
-/**
- * @brief Evaluate JavaScript code in a fresh context
- *
- * Creates a new runtime and context for each invocation, evaluates the code,
- * captures the return value, and cleans up resources. This ensures isolation
- * between evaluations.
- *
- * @param code_ptr Pointer to JavaScript source code (in WASM linear memory)
- * @param len Number of bytes to read from code_ptr
- *
- * @return Status code:
- *   0 = Success (result available via get_result_ptr/get_result_len)
- *   20 = Failed to create runtime
- *   21 = Failed to create context
- *   22 = Evaluation resulted in exception (see get_last_error_ptr)
- *   23 = Global object is null/undefined
- *   24 = code_ptr is NULL
- *   25 = Failed to allocate code buffer
- *   26 = Failed to convert result to string
- *
- * On success, call get_result_ptr() and get_result_len() to retrieve the
- * JavaScript return value as a string. Primitives are converted to their
- * string representation, objects and arrays are converted to JSON.
- *
- * On error, call get_last_error_ptr() and get_last_error_len() to retrieve
- * a human-readable error message including exception details and stack trace.
- */
-__attribute__((export_name("eval_js")))
-int eval_js(const char* code_ptr, int len)
-{
-    // Validate input
-    if (code_ptr == NULL) {
-        set_error("code_ptr is NULL");
-        return 24;
-    }
-    
-    // Create fresh runtime and context for this evaluation
-    JSRuntime* rt = JS_NewRuntime();
-    if (!rt) {
-        set_error("Failed to create JavaScript runtime");
-        return 20;
+// Evaluates a script the host wrote into a buffer from sb_alloc, and frees
+// that buffer.
+//
+// With report_result = 0 the value is discarded (bootstrap scripts). With
+// report_result = 1 the value is the execution's outcome: a promise is settled
+// by running the job queue, then a fulfilled value goes to host.result and a
+// rejection or a thrown error goes to host.error.
+__attribute__((export_name("sb_eval")))
+int sb_eval(char* code, int code_len, const char* name, int name_len, int report_result) {
+    if (!g_ctx) {
+        free(code);
+        return SB_NOT_INITIALIZED;
     }
 
-    JSContext* ctx = JS_NewContext(rt);
-    if (!ctx) {
-        set_error("Failed to create JavaScript context");
-        JS_FreeRuntime(rt);
-        return 21;
+    char filename[128];
+    int copy_len = name_len < (int)sizeof(filename) - 1 ? name_len : (int)sizeof(filename) - 1;
+    memcpy(filename, name, (size_t)copy_len);
+    filename[copy_len] = '\0';
+
+    // JS_Eval reads a terminating NUL one past the end of the source.
+    char* source = realloc(code, (size_t)code_len + 1);
+    if (!source) {
+        free(code);
+        report_c_error("InternalError", "Out of memory while loading the script");
+        return SB_OUT_OF_MEMORY;
+    }
+    source[code_len] = '\0';
+
+    JSValue value = JS_Eval(g_ctx, source, (size_t)code_len, filename, JS_EVAL_TYPE_GLOBAL);
+    free(source);
+
+    if (JS_IsException(value)) {
+        report_pending_exception(g_ctx);
+        return SB_SCRIPT_ERROR;
     }
 
-    // Disable stack limit checks for WASI
-    // Setting to 0 disables the check entirely (QuickJS default is very conservative for WASI)
-    JS_SetMaxStackSize(rt, 0);
-
-    // Install console.log and __host_call_json
-    if (install_host_bridge(ctx) != 0) {
-        // install_host_bridge already set an error message
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
-        return 23;
+    if (drain_jobs() != 0) {
+        JS_FreeValue(g_ctx, value);
+        return SB_SCRIPT_ERROR;
     }
 
-    // Create a null-terminated copy of the code buffer
-    // This is necessary because JS_Eval may read past the boundary in certain edge cases
-    char* code_copy = js_malloc_rt(rt, len + 1);
-    if (!code_copy) {
-        set_error("Failed to allocate code buffer (%d bytes)", len + 1);
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
-        return 25;
-    }
-    
-    // Copy code and ensure null termination
-    for (int i = 0; i < len; i++) {
-        code_copy[i] = code_ptr[i];
-    }
-    code_copy[len] = '\0';
-
-    // Evaluate the code in the existing global scope (no flags = use current context's global)
-    // Note: JS_EVAL_TYPE_GLOBAL creates a NEW global scope, which would lose our bridge functions!
-    JSValue result = JS_Eval(ctx, code_copy, len, "eval", 0);
-
-    // Handle evaluation result
-    if (JS_IsException(result)) {
-        JSValue exc = JS_GetException(ctx);
-        capture_exception(ctx, exc);
-        JS_FreeValue(ctx, exc);
-        JS_FreeValue(ctx, result);
-        js_free_rt(rt, code_copy);
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
-        return 22;
+    if (!report_result) {
+        JS_FreeValue(g_ctx, value);
+        return SB_OK;
     }
 
-    // Success - capture the result value
-    if (js_value_to_string(ctx, result, g_result, sizeof(g_result)) != 0) {
-        // Failed to convert result to string
-        JS_FreeValue(ctx, result);
-        js_free_rt(rt, code_copy);
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
-        return 26;  // New error code for result conversion failure
+    int status;
+    switch ((int)JS_PromiseState(g_ctx, value)) {
+        case -1:
+            status = report_value(value);
+            break;
+        case JS_PROMISE_FULFILLED: {
+            JSValue settled = JS_PromiseResult(g_ctx, value);
+            status = report_value(settled);
+            JS_FreeValue(g_ctx, settled);
+            break;
+        }
+        case JS_PROMISE_REJECTED: {
+            JSValue reason = JS_PromiseResult(g_ctx, value);
+            report_exception(g_ctx, reason);
+            JS_FreeValue(g_ctx, reason);
+            status = SB_SCRIPT_ERROR;
+            break;
+        }
+        default:
+            // Host calls are synchronous, so once the job queue is empty
+            // nothing is left that could settle this promise.
+            report_c_error("Error",
+                "The script awaited a promise that never settled. Host API calls return their values directly; "
+                "a promise you create yourself must be resolved by your own code.");
+            status = SB_SCRIPT_ERROR;
+            break;
     }
 
-    JS_FreeValue(ctx, result);
-    js_free_rt(rt, code_copy);
-    JS_FreeContext(ctx);
-    JS_FreeRuntime(rt);
-    set_error("OK");
-    return 0;
-}
-
-// ---------- Diagnostic Functions ----------
-
-/**
- * @brief Minimal QuickJS self-test
- * 
- * Runs a simple expression evaluation (1+1) to verify that QuickJS is properly
- * initialized and that the evaluation pipeline works. This is useful for
- * diagnosing build or environment issues.
- * 
- * @return Status code:
- *   0 = Success (QuickJS is functional)
- *   100 = Failed to create runtime
- *   101 = Failed to create context
- *   102 = Failed to evaluate test expression
- * 
- * The result or error message is available via get_last_error_ptr().
- */
-__attribute__((export_name("quickjs_selftest")))
-int quickjs_selftest(void) {
-    JSRuntime* rt = JS_NewRuntime();
-    if (!rt) {
-        set_error("Selftest: Failed to create runtime");
-        return 100;
-    }
-
-    JSContext* ctx = JS_NewContext(rt);
-    if (!ctx) {
-        set_error("Selftest: Failed to create context");
-        JS_FreeRuntime(rt);
-        return 101;
-    }
-
-    // Disable stack checks for testing
-    JS_SetMaxStackSize(rt, 0);
-
-    // Simple test: evaluate "1+1"
-    const char* src = "1+1";
-    JSValue result = JS_Eval(ctx, src, 3, "selftest", JS_EVAL_TYPE_GLOBAL);
-
-    if (JS_IsException(result)) {
-        JSValue exc = JS_GetException(ctx);
-        capture_exception(ctx, exc);
-        JS_FreeValue(ctx, exc);
-        JS_FreeValue(ctx, result);
-        JS_FreeContext(ctx);
-        JS_FreeRuntime(rt);
-        return 102;
-    }
-
-    JS_FreeValue(ctx, result);
-    JS_FreeContext(ctx);
-    JS_FreeRuntime(rt);
-    set_error("Selftest: OK (QuickJS is functional)");
-    return 0;
+    JS_FreeValue(g_ctx, value);
+    return status;
 }

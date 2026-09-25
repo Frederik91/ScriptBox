@@ -1,11 +1,6 @@
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Reflection;
-using System.Text;
+using System.IO;
+using System.Text.Json;
 using System.Threading;
-using System.Threading.Tasks;
-using ScriptBox.Core.Configuration;
 using ScriptBox.Core.Runtime;
 using ScriptBox.Core.WasmExecution;
 
@@ -28,63 +23,38 @@ public static class BuilderMetadataContext
 }
 
 /// <summary>
-/// Fluent builder for configuring ScriptBox instances.
+/// Configures a <see cref="IScriptBox"/>. A script can reach nothing but the
+/// APIs registered here: there is no file system, network or clock beyond
+/// what those APIs provide.
 /// </summary>
 public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
 {
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromSeconds(30);
+    public const long DefaultMemoryLimitBytes = 256L * 1024 * 1024;
+
     private static readonly List<Func<ISandboxApiScanner>> _defaultScannerFactories = new();
     private static readonly object _scannerLock = new();
 
-    private readonly HostApiBuilder _hostApiBuilder = new();
     private readonly List<Func<CancellationToken, Task<string>>> _startupScriptLoaders = new();
     private readonly List<(Type Type, string? Namespace)> _registeredApiTypes = new();
     private readonly List<(object Instance, string? Namespace)> _registeredApiInstances = new();
     private readonly Dictionary<string, object> _metadata = new();
     private readonly List<ISandboxApiScanner> _apiScanners = new();
+    private readonly Dictionary<Type, string> _typeScriptOverrides = new();
     private string? _wasmModulePath;
     private byte[]? _wasmModuleBytes;
-    private TimeSpan _executionTimeout = TimeSpan.FromMilliseconds(WasmConfiguration.DefaultTimeoutMs);
-    private SandboxConfiguration? _sandboxConfiguration;
+    private TimeSpan _executionTimeout = DefaultTimeout;
+    private long _memoryLimitBytes = DefaultMemoryLimitBytes;
+    private int _maxLogEntries = 1000;
+    private int _maxLogEntryLength = 8 * 1024;
+    private int _maxResultBytes = 4 * 1024 * 1024;
+    private bool _sealHostResults;
+    private JsonSerializerOptions? _jsonOptions;
     private Func<Type, object?>? _apiFactory;
 
     private ScriptBoxBuilder()
     {
-        _startupScriptLoaders.Add(_ => Task.FromResult(DefaultRuntimeResources.LoadCoreBootstrap()));
         _apiScanners.Add(new AttributedSandboxApiScanner());
-    }
-
-    /// <summary>
-    /// Ensures all default scanners registered so far are added to this builder instance.
-    /// This is called lazily to handle module initializers that register scanners after builder creation.
-    /// </summary>
-    private void EnsureDefaultScannersLoaded()
-    {
-        lock (_scannerLock)
-        {
-            // Check if there are any default scanners we haven't loaded yet
-            var scannersToAdd = _defaultScannerFactories.Count - (_apiScanners.Count - 1); // -1 for AttributedSandboxApiScanner
-            if (scannersToAdd <= 0)
-            {
-                return; // All scanners already loaded
-            }
-
-            // Temporarily expose metadata dictionary for scanner factories
-            var previousMetadata = BuilderMetadataContext.Current;
-            BuilderMetadataContext.Current = _metadata;
-            try
-            {
-                // Add only the new scanners (skip the ones we've already added)
-                var startIndex = _apiScanners.Count - 1; // -1 for AttributedSandboxApiScanner
-                for (int i = startIndex; i < _defaultScannerFactories.Count; i++)
-                {
-                    _apiScanners.Add(_defaultScannerFactories[i]());
-                }
-            }
-            finally
-            {
-                BuilderMetadataContext.Current = previousMetadata;
-            }
-        }
     }
 
     public static ScriptBoxBuilder Create() => new();
@@ -93,7 +63,6 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     /// Registers a default scanner factory that will be automatically added to all new ScriptBoxBuilder instances.
     /// This is typically called by package module initializers (e.g., ScriptBox.SemanticKernel).
     /// </summary>
-    /// <param name="scannerFactory">Factory function that creates a scanner instance.</param>
     public static void RegisterDefaultScanner(Func<ISandboxApiScanner> scannerFactory)
     {
         if (scannerFactory is null)
@@ -107,13 +76,36 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
         }
     }
 
+    private void EnsureDefaultScannersLoaded()
+    {
+        lock (_scannerLock)
+        {
+            // -1 for the AttributedSandboxApiScanner every builder starts with.
+            var alreadyLoaded = _apiScanners.Count - 1;
+            if (_defaultScannerFactories.Count <= alreadyLoaded)
+            {
+                return;
+            }
+
+            var previousMetadata = BuilderMetadataContext.Current;
+            BuilderMetadataContext.Current = _metadata;
+            try
+            {
+                for (var i = alreadyLoaded; i < _defaultScannerFactories.Count; i++)
+                {
+                    _apiScanners.Add(_defaultScannerFactories[i]());
+                }
+            }
+            finally
+            {
+                BuilderMetadataContext.Current = previousMetadata;
+            }
+        }
+    }
+
     internal ScriptBoxBuilder WithApiScanner(ISandboxApiScanner scanner)
     {
-        if (scanner is null)
-        {
-            throw new ArgumentNullException(nameof(scanner));
-        }
-        _apiScanners.Add(scanner);
+        _apiScanners.Add(scanner ?? throw new ArgumentNullException(nameof(scanner)));
         return this;
     }
 
@@ -151,17 +143,18 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
         return WithStartupScript(_ => Task.FromResult(BootstrapScriptLoader.LoadScriptFile(path)));
     }
 
+    /// <summary>
+    /// Adds JavaScript evaluated before every script, after the registered APIs are defined.
+    /// </summary>
     public ScriptBoxBuilder WithStartupScript(Func<CancellationToken, Task<string>> loader)
     {
-        if (loader is null)
-        {
-            throw new ArgumentNullException(nameof(loader));
-        }
-
-        _startupScriptLoaders.Add(loader);
+        _startupScriptLoaders.Add(loader ?? throw new ArgumentNullException(nameof(loader)));
         return this;
     }
 
+    /// <summary>
+    /// Wall-clock limit for one execution, host calls included. Zero means no limit.
+    /// </summary>
     public ScriptBoxBuilder WithExecutionTimeout(TimeSpan timeout)
     {
         if (timeout < TimeSpan.Zero)
@@ -173,35 +166,85 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
         return this;
     }
 
-    public ScriptBoxBuilder RegisterApisFrom<T>(string? name = null)
+    /// <summary>
+    /// Upper bound on the sandbox's linear memory, which holds the whole
+    /// JavaScript heap. A script that exceeds it fails with <see cref="ScriptErrorKind.MemoryLimit"/>.
+    /// </summary>
+    public ScriptBoxBuilder WithMemoryLimit(long bytes)
     {
-        return RegisterApisFrom(typeof(T), name);
-    }
-
-    public ScriptBoxBuilder RegisterApisFrom(Type type, string? name = null)
-    {
-        if (type is null)
+        if (bytes < 16 * 1024 * 1024)
         {
-            throw new ArgumentNullException(nameof(type));
+            throw new ArgumentOutOfRangeException(nameof(bytes), "The QuickJS runtime needs at least 16 MB.");
         }
 
-        _registeredApiTypes.Add((type, name));
+        _memoryLimitBytes = bytes;
         return this;
     }
 
-    public ScriptBoxBuilder AddFromType<T>(string? name = null)
+    public ScriptBoxBuilder WithLogLimits(int maxEntries, int maxEntryLength)
     {
-        return RegisterApisFrom(typeof(T), name);
+        _maxLogEntries = maxEntries > 0 ? maxEntries : throw new ArgumentOutOfRangeException(nameof(maxEntries));
+        _maxLogEntryLength = maxEntryLength > 0 ? maxEntryLength : throw new ArgumentOutOfRangeException(nameof(maxEntryLength));
+        return this;
     }
+
+    /// <summary>
+    /// The largest return value, as UTF-8 JSON, a script may produce. A larger one fails the run with a
+    /// message asking for less, rather than handing the caller a payload it did not plan for.
+    /// </summary>
+    public ScriptBoxBuilder WithResultLimit(int maxBytes)
+    {
+        _maxResultBytes = maxBytes > 0 ? maxBytes : throw new ArgumentOutOfRangeException(nameof(maxBytes));
+        return this;
+    }
+
+    /// <summary>
+    /// Seals every object a host call returns, recursively. Assigning a
+    /// property the object does not already have then throws a TypeError at
+    /// that line instead of silently adding it, which turns a misspelt member
+    /// name into an error the script's author sees. Arrays stay growable.
+    /// </summary>
+    public ScriptBoxBuilder SealHostResults(bool seal = true)
+    {
+        _sealHostResults = seal;
+        return this;
+    }
+
+    /// <summary>
+    /// The serializer for host call arguments and results, which also decides
+    /// the property names in the generated TypeScript declarations. Defaults to
+    /// <see cref="ScriptBoxJson.CreateDefaultOptions"/>.
+    /// </summary>
+    public ScriptBoxBuilder WithJsonSerializerOptions(JsonSerializerOptions options)
+    {
+        _jsonOptions = options ?? throw new ArgumentNullException(nameof(options));
+        return this;
+    }
+
+    /// <summary>
+    /// Declares a type as <paramref name="typeScript"/> in the generated
+    /// declarations, for types whose JSON shape comes from a custom converter.
+    /// </summary>
+    public ScriptBoxBuilder WithTypeScriptType(Type type, string typeScript)
+    {
+        _typeScriptOverrides[type ?? throw new ArgumentNullException(nameof(type))] =
+            string.IsNullOrWhiteSpace(typeScript) ? throw new ArgumentException("A TypeScript type is required.", nameof(typeScript)) : typeScript;
+        return this;
+    }
+
+    public ScriptBoxBuilder RegisterApisFrom<T>(string? name = null) => RegisterApisFrom(typeof(T), name);
+
+    public ScriptBoxBuilder RegisterApisFrom(Type type, string? name = null)
+    {
+        _registeredApiTypes.Add((type ?? throw new ArgumentNullException(nameof(type)), name));
+        return this;
+    }
+
+    public ScriptBoxBuilder AddFromType<T>(string? name = null) => RegisterApisFrom(typeof(T), name);
 
     public ScriptBoxBuilder AddFromObject(object instance, string? name = null)
     {
-        if (instance is null)
-        {
-            throw new ArgumentNullException(nameof(instance));
-        }
-
-        _registeredApiInstances.Add((instance, name));
+        _registeredApiInstances.Add((instance ?? throw new ArgumentNullException(nameof(instance)), name));
         return this;
     }
 
@@ -224,213 +267,128 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
 
     public T? GetMetadata<T>(string key)
     {
-        if (_metadata.TryGetValue(key, out var value) && value is T typedValue)
-        {
-            return typedValue;
-        }
-        return default;
+        return _metadata.TryGetValue(key, out var value) && value is T typedValue ? typedValue : default;
     }
 
     public IScriptBox Build()
     {
-        ProcessAttributedApis();
-
-        var moduleSource = ResolveModuleSource();
-        var configStartupScripts = _sandboxConfiguration?.StartupScripts?.ToList();
-        var startupCode = LoadStartupCode(configStartupScripts);
-        var hostHandlers = _hostApiBuilder.Build();
-
-        var config = _sandboxConfiguration ?? SandboxConfiguration.CreateDefault();
-        config.StartupScripts = new List<string>(); // Builder injects scripts directly
-
-        var executor = new WasmScriptExecutor(
-            hostApi: null,
-            config: config,
-            jsonHandlers: hostHandlers,
-            moduleSource: moduleSource);
-
-        return new ScriptBox(executor, startupCode, _executionTimeout, _metadata);
-    }
-
-    private WasmModuleSource ResolveModuleSource()
-    {
-        if (_wasmModuleBytes is not null)
-        {
-            return WasmModuleSource.FromBytes(_wasmModuleBytes);
-        }
-
-        if (!string.IsNullOrWhiteSpace(_wasmModulePath))
-        {
-            return WasmModuleSource.FromPath(_wasmModulePath!);
-        }
-
-        var embedded = DefaultRuntimeResources.LoadEmbeddedWasm();
-        return WasmModuleSource.FromBytes(embedded);
-    }
-
-    private string LoadStartupCode(IEnumerable<string>? configScripts)
-    {
-        var builder = new StringBuilder();
-
-        foreach (var loader in _startupScriptLoaders)
-        {
-            var code = loader(CancellationToken.None).GetAwaiter().GetResult();
-            AppendStartupScript(builder, code);
-        }
-
-        if (configScripts != null)
-        {
-            foreach (var scriptPath in configScripts)
-            {
-                var code = BootstrapScriptLoader.LoadScriptFile(scriptPath);
-                AppendStartupScript(builder, code);
-            }
-        }
-
-        return builder.ToString();
-    }
-
-    private static void AppendStartupScript(StringBuilder builder, string code)
-    {
-        if (string.IsNullOrWhiteSpace(code))
-        {
-            return;
-        }
-
-        builder.AppendLine(code);
-        builder.AppendLine();
-    }
-
-    internal ScriptBoxBuilder ConfigureHostApi(Func<HostApiBuilder, HostApiBuilder> configure)
-    {
-        if (configure is null)
-        {
-            throw new ArgumentNullException(nameof(configure));
-        }
-
-        configure(_hostApiBuilder);
-        return this;
-    }
-
-    private void ProcessAttributedApis()
-    {
-        if (_registeredApiTypes.Count == 0 && _registeredApiInstances.Count == 0)
-        {
-            return;
-        }
-
-        // Ensure all default scanners are loaded (handles module initializers that run after builder creation)
         EnsureDefaultScannersLoaded();
 
-        var descriptorsAndInstances = new List<(SandboxApiDescriptor Descriptor, object? Instance)>();
-
-        foreach (var (type, ns) in _registeredApiTypes)
+        var apis = new List<SandboxApiDescriptor>();
+        var fixedInstances = new Dictionary<string, object>(StringComparer.Ordinal);
+        foreach (var (type, ns) in _registeredApiTypes.Distinct())
         {
-            SandboxApiDescriptor? descriptor = null;
-            foreach (var scanner in _apiScanners)
-            {
-                if (scanner.TryCreateDescriptor(type, ns, out descriptor))
-                {
-                    break;
-                }
-            }
-
-            if (descriptor is null)
-            {
-                throw new InvalidOperationException(
-                    $"Type '{type.FullName}' could not be processed by any registered API scanner. Ensure it has the correct attributes (e.g. [SandboxApi]).");
-            }
-
-            descriptorsAndInstances.Add((descriptor, null));
+            apis.Add(Describe(type, ns));
         }
 
         foreach (var (instance, ns) in _registeredApiInstances)
         {
-            var type = instance.GetType();
-            SandboxApiDescriptor? descriptor = null;
-            foreach (var scanner in _apiScanners)
+            var descriptor = Describe(instance.GetType(), ns);
+            apis.Add(descriptor);
+            fixedInstances[descriptor.JsNamespace] = instance;
+        }
+
+        foreach (var api in apis)
+        {
+            RequireIdentifier(api.JsNamespace, api.ApiType);
+            foreach (var method in api.Methods)
             {
-                if (scanner.TryCreateDescriptor(type, ns, out descriptor))
-                {
-                    break;
-                }
+                RequireIdentifier(method.JsMethodName, api.ApiType);
             }
+        }
 
-            if (descriptor is null)
+        var duplicate = apis.GroupBy(a => a.JsNamespace).FirstOrDefault(g => g.Count() > 1);
+        if (duplicate is not null)
+        {
+            throw new InvalidOperationException($"More than one API is registered as '{duplicate.Key}'.");
+        }
+
+        var handlers = new HostApiBuilder();
+        AttributedSandboxApiRegistry.RegisterHandlers(apis, handlers);
+
+        var jsonOptions = _jsonOptions ?? ScriptBoxJson.CreateDefaultOptions();
+        var executor = new WasmScriptExecutor(ResolveModule(), handlers.Build(), jsonOptions);
+        var limits = new ExecutionLimits
+        {
+            Timeout = _executionTimeout,
+            MemoryBytes = _memoryLimitBytes,
+            MaxLogEntries = _maxLogEntries,
+            MaxLogEntryLength = _maxLogEntryLength,
+            MaxResultBytes = _maxResultBytes,
+        };
+
+        return new ScriptBox(
+            executor,
+            BuildBootstrap(apis),
+            apis,
+            fixedInstances,
+            _apiFactory,
+            limits,
+            jsonOptions,
+            new Dictionary<Type, string>(_typeScriptOverrides),
+            _metadata);
+    }
+
+    private static readonly HashSet<string> ReservedNames = new(StringComparer.Ordinal) { "console", "globalThis", "__scriptbox", "__host" };
+
+    private static void RequireIdentifier(string name, Type apiType)
+    {
+        var valid = name.Length > 0
+            && (char.IsLetter(name[0]) || name[0] == '_' || name[0] == '$')
+            && name.All(c => char.IsLetterOrDigit(c) || c == '_' || c == '$')
+            && !ReservedNames.Contains(name);
+        if (!valid)
+        {
+            throw new InvalidOperationException($"'{name}' on {apiType.Name} is not usable as a JavaScript name.");
+        }
+    }
+
+    private SandboxApiDescriptor Describe(Type type, string? ns)
+    {
+        foreach (var scanner in _apiScanners)
+        {
+            if (scanner.TryCreateDescriptor(type, ns, out var descriptor))
             {
-                throw new InvalidOperationException(
-                    $"Type '{type.FullName}' (from instance) could not be processed by any registered API scanner. Ensure it has the correct attributes (e.g. [SandboxApi]).");
+                return descriptor;
             }
-
-            descriptorsAndInstances.Add((descriptor, instance));
         }
 
-        if (descriptorsAndInstances.Count == 0)
-        {
-            return;
-        }
-
-        var bootstrap = AttributedSandboxApiRegistry.BuildBootstrap(descriptorsAndInstances.Select(x => x.Descriptor));
-        if (!string.IsNullOrWhiteSpace(bootstrap))
-        {
-            _startupScriptLoaders.Add(_ => Task.FromResult(bootstrap));
-        }
-
-        AttributedSandboxApiRegistry.RegisterHandlers(
-            descriptorsAndInstances,
-            _hostApiBuilder,
-            ResolveApiInstance);
+        throw new InvalidOperationException(
+            $"Type '{type.FullName}' could not be processed by any registered API scanner. Ensure it has the correct attributes (e.g. [SandboxApi]).");
     }
 
-    private object ResolveApiInstance(Type apiType)
+    private List<BootstrapScript> BuildBootstrap(IReadOnlyList<SandboxApiDescriptor> apis)
     {
-        if (apiType is null)
+        var options = JsonSerializer.Serialize(new Dictionary<string, object> { ["sealResults"] = _sealHostResults });
+        var scripts = new List<BootstrapScript>
         {
-            throw new ArgumentNullException(nameof(apiType));
+            new("scriptbox.js", $"globalThis.__scriptbox_options = {options};\n{DefaultRuntimeResources.LoadCoreBootstrap()}"),
+        };
+
+        var apiBootstrap = AttributedSandboxApiRegistry.BuildBootstrap(apis);
+        if (!string.IsNullOrWhiteSpace(apiBootstrap))
+        {
+            scripts.Add(new BootstrapScript("apis.js", apiBootstrap));
         }
 
-        object? instance = null;
-        if (_apiFactory is not null)
+        for (var i = 0; i < _startupScriptLoaders.Count; i++)
         {
-            instance = _apiFactory(apiType);
+            var code = _startupScriptLoaders[i](CancellationToken.None).GetAwaiter().GetResult();
+            if (!string.IsNullOrWhiteSpace(code))
+            {
+                scripts.Add(new BootstrapScript($"startup-{i + 1}.js", code));
+            }
         }
 
-        if (instance is null)
-        {
-            instance = Activator.CreateInstance(apiType);
-        }
-
-        if (instance is null)
-        {
-            throw new InvalidOperationException(
-                $"Unable to create API instance for type '{apiType.FullName}'. Provide a factory via WithApiFactory.");
-        }
-
-        return instance;
+        return scripts;
     }
 
-    public ScriptBoxBuilder WithSandboxConfiguration(SandboxConfiguration configuration)
+    private Wasmtime.Module ResolveModule()
     {
-        _sandboxConfiguration = configuration ?? throw new ArgumentNullException(nameof(configuration));
-        return this;
-    }
-
-    public ScriptBoxBuilder ConfigureFileSystem(Action<FileSystemConfigurationBuilder> configure)
-    {
-        if (configure is null) throw new ArgumentNullException(nameof(configure));
-        var config = _sandboxConfiguration ??= SandboxConfiguration.CreateDefault();
-        var builder = new FileSystemConfigurationBuilder(config);
-        configure(builder);
-        return this;
-    }
-
-    public ScriptBoxBuilder ConfigureNetwork(Action<NetworkConfigurationBuilder> configure)
-    {
-        if (configure is null) throw new ArgumentNullException(nameof(configure));
-        var config = _sandboxConfiguration ??= SandboxConfiguration.CreateDefault();
-        var builder = new NetworkConfigurationBuilder(config);
-        configure(builder);
-        return this;
+        var bytes = _wasmModuleBytes
+            ?? (_wasmModulePath is not null ? File.ReadAllBytes(_wasmModulePath) : null)
+            ?? DefaultRuntimeResources.LoadEmbeddedWasm().ToArray();
+        return WasmRuntime.GetModule(bytes);
     }
 
     #region IScriptBoxConfigurator Explicit Implementation
@@ -440,99 +398,17 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     IScriptBoxConfigurator IScriptBoxConfigurator.WithStartupFile(string path) => WithStartupFile(path);
     IScriptBoxConfigurator IScriptBoxConfigurator.WithStartupScript(Func<CancellationToken, Task<string>> loader) => WithStartupScript(loader);
     IScriptBoxConfigurator IScriptBoxConfigurator.WithExecutionTimeout(TimeSpan timeout) => WithExecutionTimeout(timeout);
+    IScriptBoxConfigurator IScriptBoxConfigurator.WithMemoryLimit(long bytes) => WithMemoryLimit(bytes);
+    IScriptBoxConfigurator IScriptBoxConfigurator.WithResultLimit(int maxBytes) => WithResultLimit(maxBytes);
+    IScriptBoxConfigurator IScriptBoxConfigurator.SealHostResults(bool seal) => SealHostResults(seal);
+    IScriptBoxConfigurator IScriptBoxConfigurator.WithJsonSerializerOptions(JsonSerializerOptions options) => WithJsonSerializerOptions(options);
+    IScriptBoxConfigurator IScriptBoxConfigurator.WithTypeScriptType(Type type, string typeScript) => WithTypeScriptType(type, typeScript);
     IScriptBoxConfigurator IScriptBoxConfigurator.RegisterApisFrom<T>(string? name) => RegisterApisFrom<T>(name);
     IScriptBoxConfigurator IScriptBoxConfigurator.RegisterApisFrom(Type type, string? name) => RegisterApisFrom(type, name);
     IScriptBoxConfigurator IScriptBoxConfigurator.AddFromType<T>(string? name) => AddFromType<T>(name);
     IScriptBoxConfigurator IScriptBoxConfigurator.AddFromObject(object instance, string? name) => AddFromObject(instance, name);
     IScriptBoxConfigurator IScriptBoxConfigurator.WithApiFactory(Func<Type, object?> apiFactory) => WithApiFactory(apiFactory);
     IScriptBoxConfigurator IScriptBoxConfigurator.WithMetadata(string key, object value) => WithMetadata(key, value);
-    IScriptBoxConfigurator IScriptBoxConfigurator.WithSandboxConfiguration(SandboxConfiguration configuration) => WithSandboxConfiguration(configuration);
-    IScriptBoxConfigurator IScriptBoxConfigurator.ConfigureFileSystem(Action<FileSystemConfigurationBuilder> configure) => ConfigureFileSystem(configure);
-    IScriptBoxConfigurator IScriptBoxConfigurator.ConfigureNetwork(Action<NetworkConfigurationBuilder> configure) => ConfigureNetwork(configure);
 
     #endregion
-
-    public sealed class FileSystemConfigurationBuilder
-    {
-        private readonly SandboxConfiguration _config;
-
-        internal FileSystemConfigurationBuilder(SandboxConfiguration config)
-        {
-            _config = config;
-        }
-
-        public FileSystemConfigurationBuilder WithRootDirectory(string path)
-        {
-            if (string.IsNullOrWhiteSpace(path))
-            {
-                throw new ArgumentException("Sandbox directory cannot be null or empty", nameof(path));
-            }
-            _config.SandboxDirectory = path;
-            return this;
-        }
-
-        public FileSystemConfigurationBuilder WithConsentHook(Func<FileSystemConsentContext, bool> hook)
-        {
-            _config.FileSystemConsentHook = hook;
-            return this;
-        }
-    }
-
-    public sealed class NetworkConfigurationBuilder
-    {
-        private readonly SandboxConfiguration _config;
-
-        internal NetworkConfigurationBuilder(SandboxConfiguration config)
-        {
-            _config = config;
-        }
-
-        public NetworkConfigurationBuilder WithAllowedDomains(params string[] domains)
-        {
-            _config.AllowedHttpDomains ??= new List<string>();
-            if (domains != null)
-            {
-                _config.AllowedHttpDomains.AddRange(domains);
-            }
-            return this;
-        }
-
-        public NetworkConfigurationBuilder ConfigureHttpClient(Action<System.Net.Http.HttpClient> configure)
-        {
-            _config.HttpClientConfigurator = configure;
-            return this;
-        }
-
-        public NetworkConfigurationBuilder WithHttpClient(Func<System.Net.Http.HttpClient> factory)
-        {
-            _config.HttpClientFactory = factory;
-            return this;
-        }
-
-        public NetworkConfigurationBuilder WithConsentHook(Func<NetworkConsentContext, bool> hook)
-        {
-            _config.NetworkConsentHook = hook;
-            return this;
-        }
-
-        public NetworkConfigurationBuilder WithRequestTimeout(TimeSpan timeout)
-        {
-            if (timeout.TotalMilliseconds <= 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(timeout), "Timeout must be positive");
-            }
-            _config.HttpTimeoutMs = (int)timeout.TotalMilliseconds;
-            return this;
-        }
-
-        public NetworkConfigurationBuilder WithMaxResponseSize(int maxBytes)
-        {
-            if (maxBytes <= 0)
-            {
-                throw new ArgumentOutOfRangeException(nameof(maxBytes), "Size must be positive");
-            }
-            _config.MaxHttpResponseSize = maxBytes;
-            return this;
-        }
-    }
 }

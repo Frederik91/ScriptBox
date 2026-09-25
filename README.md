@@ -1,299 +1,112 @@
 # ScriptBox
 
-ScriptBox is a reusable QuickJS-in-WASM sandbox for .NET. It lets you run untrusted JavaScript/TypeScript snippets inside a deterministic WASM runtime while exposing a curated host API written in C#. The runtime ships as a NuGet package and can be configured through a fluent builder; dependency injection support lives in a separate optional package.
+ScriptBox runs untrusted JavaScript inside QuickJS compiled to WebAssembly, in-process in a .NET application. A script can reach exactly the C# APIs you register and nothing else: no file system, no network, no ambient globals. It is built for letting a language model write a short program against your application's API instead of making one tool call per step.
 
-## Performance Benchmarks
-
-We ran a simple benchmark comparing **Standard Tool Calling** (LLM calls tools one by one) vs **ScriptBox** (LLM writes a script to call tools). The results show significant token savings for multi-step tasks.
-
-| Task | Tool Calling Tokens | ScriptBox Tokens | Reduction |
-|------|---------------------|------------------|-----------|
-| **Math Operations** (7 steps) | 15,808 | 5756 | **~64%** |
-| **String/Array Ops** (8 steps) | 16,860 | 7,520 | **~55%** |
-
-*Note: These results are from our own internal benchmarks (`Examples/Scriptbox.SemanticKernel.Example`) running on GPT-4o-mini. Actual savings depend on task complexity and prompt structure.*
-
-## Packages
-
-| Package | Description |
-| ------- | ----------- |
-| `ScriptBox` | Core runtime, builder, WASM bridge, attribute-based API discovery |
-| `ScriptBox.DependencyInjection` | Optional helpers that wire `ScriptBoxBuilder` into `Microsoft.Extensions.DependencyInjection` |
-| `ScriptBox.SemanticKernel` | Semantic Kernel integration (plugin registration, `run_js` tool, TypeScript declarations) |
-
-## Quick Start (without DI)
+## Quick start
 
 ```csharp
 using ScriptBox;
 using ScriptBox.Core.Runtime;
 
-[SandboxApi("calculator")]
-public static class CalculatorApi
+[SandboxApi("tasks")]
+[Description("The tasks in the open project.")]
+public sealed class TaskApi
 {
-    [SandboxMethod("add")]
-    public static Task<int> AddAsync(int a, int b) => Task.FromResult(a + b);
+    [SandboxMethod("list")]
+    public IReadOnlyList<TaskItem> List() => /* ... */;
+
+    [SandboxMethod("rename")]
+    [Description("Renames a task. Throws if the id is unknown.")]
+    public void Rename(string id, string name) => /* ... */;
 }
 
-var sandbox = ScriptBoxBuilder
-    .Create()
-    .RegisterApisFrom(typeof(CalculatorApi)) // static API, no DI needed
+var box = ScriptBoxBuilder.Create()
+    .RegisterApisFrom<TaskApi>()
+    .SealHostResults()
     .Build();
 
-await using var session = sandbox.CreateSession();
-var result = await session.RunAsync(@"
-    const sum = calculator.add(1, 2);
-    return sum;
-");
+// Show this to the model that writes the scripts.
+string declarations = box.GetTypeScriptDeclarations();
+
+var result = await box.CreateSession().ExecuteAsync("""
+    const stale = tasks.list().filter(t => t.name.startsWith('old-'));
+    for (const t of stale) tasks.rename(t.id, t.name.slice(4));
+    return stale.length;
+    """);
+
+if (result.Succeeded) Console.WriteLine(result.Json);     // "3"
+else Console.WriteLine(result.Error);                      // name, message, stack with line numbers
 ```
 
-### Instance APIs without DI
+A script is the body of an async function: `return` produces the result, `await` works, and strict mode is on. Host calls are synchronous and return their values directly.
+
+## What a script sees
+
+- **Registered APIs**, one global per `[SandboxApi]` namespace. Arguments are bound to the C# parameters with System.Text.Json: objects, lists, enums as names, optional parameters with defaults, and nullable parameters. A wrong argument count or shape fails with a message naming the parameter.
+- **`console.log/info/warn/error`**, captured in `ScriptExecutionResult.Logs`.
+- **Errors from the host**: an exception in a host method becomes a JavaScript `Error` the script can catch. Throw `ScriptApiException` to choose its name and to write a message for the script's author. An uncaught error ends the script with a stack that refers to the submitted source's line numbers.
+- **A fresh realm every time**: nothing a script defines survives into the next execution. State that should persist lives host-side, in API instances or `ScriptSession.Items`.
+
+## TypeScript declarations
+
+`GetTypeScriptDeclarations()` declares every registered namespace and each type reachable from its signatures. `[Description]` on classes, methods, parameters, properties and enum members becomes JSDoc. Shapes are read from the serializer contract, so renamed and ignored properties, nullability, read-only members and `[JsonPolymorphic]` hierarchies (as discriminated unions) come out the way they are actually sent. For a type with a custom converter, declare it yourself with `WithTypeScriptType`.
+
+## Limits
+
+| Setting | Default | Behaviour when exceeded |
+| --- | --- | --- |
+| `WithExecutionTimeout` | 30 s, host calls included | `ScriptErrorKind.Timeout`; the host call in progress sees its `CancellationToken` cancelled |
+| `WithMemoryLimit` | 256 MB of linear memory | `ScriptErrorKind.MemoryLimit` |
+| Recursion | about 3,600 frames deep | a catchable `InternalError: stack overflow` |
+| `WithLogLimits` | 1,000 entries of 8 KB | later output is dropped with a note |
+
+Cancelling the token passed to `ExecuteAsync` stops the script and throws `OperationCanceledException`. Payload sizes are not limited beyond memory: arguments, results and host responses of several megabytes pass through.
+
+## Per-session API instances
+
+Register the API type once on the builder, then serve an instance per session. Use this when a script's calls should act on one request's state:
 
 ```csharp
-[SandboxApi("files")]
-public class FileApi
-{
-    [SandboxMethod("readText")]
-    public string ReadText(string path) => File.ReadAllText(path);
-}
-
-var sandbox = ScriptBoxBuilder
-    .Create()
-    .RegisterApisFrom<FileApi>()             // ScriptBox will use Activator.CreateInstance<FileApi>()
-    .Build();
+var session = box.CreateSession(o => o.UseApi(new TaskApi(snapshot, changeSet)));
 ```
 
-## Using ScriptBox with Dependency Injection
+Instances not supplied per session are created on first use through `WithApiFactory` (or `Activator`), once per box.
 
-Install both packages:
+## Sealed results
 
-```xml
-<PackageReference Include="ScriptBox" Version="*" />
-<PackageReference Include="ScriptBox.DependencyInjection" Version="*" />
+With `SealHostResults()`, every object a host call returns is sealed recursively. Changing an existing property works, but assigning one the object does not have throws a `TypeError` at that line, so `item.nmae = 'x'` fails loudly instead of being silently ignored. Arrays stay growable.
+
+## Packages
+
+| Package | Description |
+| ------- | ----------- |
+| `ScriptBox` | Runtime, builder, API binding, TypeScript declarations |
+| `ScriptBox.DependencyInjection` | Registers `IScriptBox` with `Microsoft.Extensions.DependencyInjection` |
+| `ScriptBox.SemanticKernel` | Exposes Semantic Kernel plugins as script APIs and a `run_js` kernel function |
+
+## Performance
+
+On a desktop machine, building the first box (which compiles the WASM module once per process) takes about 150 ms. Each execution after that costs about 1.3 ms, and a host call about 20 µs. The benchmark in `Examples/Scriptbox.SemanticKernel.Example` compares a model calling tools one by one with the same model writing one script: 55–64% fewer tokens on 7–8 step tasks with GPT-4o-mini.
+
+## Building the WASM module
+
+`ScriptBox.Wasm/scriptbox_wrapper.c` is the guest side; its header comment documents the ABI. After changing it:
+
+```bash
+WASI_SDK_PATH=~/wasi-sdk-28.0 bash ScriptBox.Wasm/build.sh
 ```
 
-Then integrate inside `Program.cs` or wherever you build your `IServiceProvider`:
+The script clones QuickJS into `ScriptBox.Wasm/quickjs` on first use. CI builds the module the same way (`.github/workflows/build-wasm.yml`).
 
-```csharp
-using ScriptBox;
-using ScriptBox.DependencyInjection;
-
-[SandboxApi("calculator")]
-public class CalculatorApi
-{
-    private readonly ILogger<CalculatorApi> _logger;
-    public CalculatorApi(ILogger<CalculatorApi> logger) => _logger = logger;
-
-    [SandboxMethod("add")]
-    public int Add(int a, int b)
-    {
-        _logger.LogInformation("Adding {A} + {B}", a, b);
-        return a + b;
-    }
-}
-
-builder.Services.AddTransient<CalculatorApi>();
-
-builder.Services.AddScriptBox((box, sp) =>
-{
-    box.RegisterApisFrom<CalculatorApi>();   // instance resolved via DI (ActivatorUtilities)
-});
-```
-
-At runtime you can inject `IScriptBox` anywhere:
-
-```csharp
-public class ScriptRunner
-{
-    private readonly IScriptBox _box;
-    public ScriptRunner(IScriptBox box) => _box = box;
-
-    public Task<object?> RunAsync(string script) =>
-        _box.CreateSession().RunAsync(script);
-}
-```
-
-This interface makes it easier to mock `ScriptBox` in unit tests.
-
-## Configuration & Security
-
-You can control file system access, network access, and resource limits using the fluent builder API.
-
-### Using Builder Methods (Recommended)
-
-```csharp
-var sandbox = ScriptBoxBuilder.Create()
-    .ConfigureFileSystem(fs =>
-    {
-        fs.WithRootDirectory(Path.Combine(Directory.GetCurrentDirectory(), "MySafeSandbox"));
-        // Optional: Add a consent hook for access outside the sandbox
-        fs.WithConsentHook(context => 
-        {
-            Console.WriteLine($"Allow {context.Operation} on {context.Path}?");
-            return Console.ReadLine() == "y";
-        });
-    })
-    .ConfigureNetwork(network =>
-    {
-        network.WithAllowedDomains("api.example.com", "microsoft.com");
-        network.WithRequestTimeout(TimeSpan.FromSeconds(10));
-        network.WithMaxResponseSize(5 * 1024 * 1024); // 5MB
-        
-        // Configure the underlying HttpClient
-        network.ConfigureHttpClient(client => 
-        {
-            client.DefaultRequestHeaders.Add("User-Agent", "ScriptBox/1.0");
-        });
-
-        // Optional: Provide a custom HttpClient factory (e.g. for mocking or auth)
-        network.WithHttpClient(() => 
-        {
-            var handler = new HttpClientHandler();
-            // handler.Proxy = ...
-            return new HttpClient(handler);
-        });
-
-        // Optional: Add a consent hook for domains not in the whitelist
-        network.WithConsentHook(context =>
-        {
-            Console.WriteLine($"Allow {context.Request.Method} to {context.Request.RequestUri}?");
-            return Console.ReadLine() == "y";
-        });
-    })
-    .Build();
-```
-
-### Using Configuration Object
-
-```csharp
-using ScriptBox.Core.Configuration;
-
-var config = new SandboxConfiguration
-{
-    // File System: Restrict access to a specific directory
-    SandboxDirectory = Path.Combine(Directory.GetCurrentDirectory(), "MySafeSandbox"),
-
-    // Network: Whitelist allowed domains (empty = allow all, null = allow all)
-    AllowedHttpDomains = new List<string> { "api.example.com", "microsoft.com" },
-
-    // Limits
-    MaxHttpResponseSize = 5 * 1024 * 1024, // 5MB
-    HttpTimeoutMs = 10000 // 10 seconds
-};
-
-var sandbox = ScriptBoxBuilder.Create()
-    .WithSandboxConfiguration(config)
-    .Build();
-```
-
-## Semantic Kernel Integration
-
-Install the additional package when you want Semantic Kernel agents to call ScriptBox through a single tool:
-
-```xml
-<PackageReference Include="ScriptBox.SemanticKernel" Version="*" />
-```
-
-The snippet below distills the approach used in `Examples/Scriptbox.SemanticKernel.Example`: register a Semantic Kernel plugin as a ScriptBox namespace, expose it through the `scriptbox.run_js` tool, and keep both sides strongly typed.
-
-When you reference the `ScriptBox.SemanticKernel` package, it automatically enables support for `[KernelFunction]` attributes. You can use the same `RegisterApisFrom` method for both regular APIs (`[SandboxApi]`) and Semantic Kernel plugins - the package handles the detection automatically.
-
-```csharp
-using System.ComponentModel;
-using Microsoft.Extensions.DependencyInjection;
-using Microsoft.SemanticKernel;
-using Microsoft.SemanticKernel.ChatCompletion;
-using ScriptBox.SemanticKernel;
-
-var builder = Kernel.CreateBuilder();
-
-// Register your preferred chat completion connector (Azure OpenAI, OpenAI, local LLM, etc.)
-// Example: builder.AddAzureOpenAIChatCompletion(deploymentName, endpoint, apiKey);
-
-// Configure sandbox security
-builder.AddScriptBox(
-    configure: scriptBox =>
-    {
-        // Configure security directly on the builder
-        scriptBox.ConfigureNetwork(net => net.WithAllowedDomains("api.weather.gov"));
-        scriptBox.ConfigureFileSystem(fs => fs.WithRootDirectory("./safe-root"));
-
-        // Register plugins to make available as js apis
-        // Works with both [SandboxApi] and [KernelFunction] attributes!
-        scriptBox.RegisterApisFrom<ClockPlugin>("time");
-    }
-);
-
-var kernel = builder.Build();
-
-var chat = kernel.GetRequiredService<IChatCompletionService>();
-var response = await chat.GetChatMessageContentsAsync(
-    new ChatHistory("Call scriptbox.run_js with `time.get_current_time()` and report the result."),
-    executionSettings: null, // supply your connector's "auto tool" settings here
-    kernel);
-
-Console.WriteLine(response.LastOrDefault()?.Content);
-
-public sealed class ClockPlugin
-{
-    [KernelFunction("get_current_time")]
-    [Description("Returns the current UTC time in ISO-8601 format.")]
-    public Task<string> GetCurrentTimeAsync()
-    {
-        var now = DateTimeOffset.UtcNow.ToString("O");
-        return Task.FromResult(now);
-    }
-}
-```
-
-This highlights the important parts—wiring ScriptBox into Semantic Kernel, registering plugins as namespaces, and letting the LLM choose the `scriptbox.run_js` function. Check the full example in `Examples/Scriptbox.SemanticKernel.Example` if you need a complete console app with extra logging and prompt helpers.
-
-### TypeScript Declaration Generation
-
-If you want to provide type information to the LLM, you can generate TypeScript declarations for your registered plugins:
-
-```csharp
-var sandbox = ScriptBoxBuilder.Create()
-    .RegisterApisFrom<ClockPlugin>("time")
-    .RegisterApisFrom<MathPlugin>("math")
-    .Build();
-
-// Generate TypeScript declarations for all registered plugins
-string typescript = sandbox.GenerateTypeScriptDeclarations();
-
-// Or retrieve metadata manually
-var metadata = sandbox.GetSemanticKernelMetadata();
-string typescript = SemanticKernelTypeScriptGenerator.Generate(metadata);
-```
-
-The generated declaration file contains one interface per namespace plus matching global variables (`time` in the example). In SK orchestration you send this `.d.ts` contents to the model, the model emits JavaScript that relies on those namespaces, and then you call `await scriptBoxPlugin.RunJavaScriptAsync(code, inputJson)` (or the `scriptbox.run_js` tool) to execute it safely.
-
-Need a working sample? `Examples/Scriptbox.SemanticKernel.Example/Program.cs` spins up a Semantic Kernel configured with a chat completion service, wires ScriptBox through `KernelSetup.AddScriptBox`, registers a `ClockPlugin` namespace, and then invokes a tool helper that asks the model to call back into `describeCurrentTime` via JavaScript. Run it to see an end-to-end Semantic Kernel ↔ ScriptBox loop.
-
-## Host API design
-
-* Annotate static or instance classes with `[SandboxApi("namespace")]`.
-* Mark public methods with `[SandboxMethod("methodName")]`.
-* Parameters are inferred by name; `CancellationToken` and `HostCallContext` can also be injected.
-* The builder automatically generates the JavaScript bootstrap code so user scripts can call `namespace.method()` immediately.
-
-## CI & Release
-
-* `.github/workflows/ci.yml` builds and tests the entire solution on every push/PR using .NET 9 & 10 SDKs.
-* `.github/workflows/publish.yml` watches tags (`v*`) and releases, packs all NuGet packages (`ScriptBox`, `ScriptBox.DependencyInjection`, and `ScriptBox.SemanticKernel`), and pushes them to nuget.org.
-
-## Repository Structure
+## Repository structure
 
 ```
-ScriptBox/                          # Core runtime
-ScriptBox.DependencyInjection/      # Optional DI helpers
-ScriptBox.SemanticKernel/           # Semantic Kernel integration
-ScriptBox.Tests/                    # xUnit test suite
-ScriptBox.SemanticKernel.Tests/     # Semantic Kernel integration tests
-Examples/ScriptBox.Example/         # Basic usage examples
-Examples/Scriptbox.SemanticKernel.Example/  # SK integration & benchmarks
-docs/                               # Additional documentation (vision)
+ScriptBox/                          Runtime
+ScriptBox.Wasm/                     QuickJS guest (C) and build script
+scripts/sdk/                        JavaScript bootstrap evaluated before every script
+ScriptBox.DependencyInjection/      DI helpers
+ScriptBox.SemanticKernel/           Semantic Kernel integration
+ScriptBox.Tests/                    Runtime tests
+ScriptBox.SemanticKernel.Tests/     Semantic Kernel tests
+Examples/                           Console examples
 ```
-
----
-
-Contributions and issues are welcome. See `docs/vision.md` for the long-term roadmap and architectural goals.

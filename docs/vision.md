@@ -24,14 +24,12 @@ Modern AI copilots constantly emit small snippets of JavaScript/TypeScript that 
 └──────────────┘call  └────────────────┘bridge└────────────────┘
 ```
 
-- **ScriptBox/Core/WasmExecution** loads `scriptbox.wasm`, inserts bootstrap scripts, and feeds user code via `eval_js`.
-- The WASM module exposes a minimal `__host.bridge(requestJson)` entry point. All host APIs are funneled through that synchronous JSON call.
-- **`scripts/sdk/scriptbox.js`** is the key developer-facing primitive. It wraps the `__host.bridge` call and exposes:
+- **ScriptBox/Core/WasmExecution** loads `scriptbox.wasm`, evaluates the bootstrap scripts, and feeds user code through `sb_eval`.
+- The WASM module exposes a minimal `__host.call(requestJson)` entry point. All host APIs are funneled through that synchronous JSON call.
+- **`scripts/sdk/scriptbox.js`** wraps `__host.call`, removes `__host` from the global scope, and exposes:
   - `__scriptbox.hostCall(method, args)` – synchronous host RPC.
   - `__scriptbox.createMethod("Namespace.Method")` – returns a callable that handles argument/response marshalling.
-- **Bootstrap scripts** are configurable (`SandboxConfiguration.StartupScripts`). By default we ship:
-  1. `scripts/sdk/scriptbox.js` – required helper.
-  2. `scripts/scriptbox.js` – example consumer API used by tests and docs. It is intentionally small; apps are expected to replace it.
+- **Bootstrap scripts**: `scriptbox.js`, then the namespaces generated from registered APIs, then anything added with `WithStartupScript`.
 
 ## Defining your own ScriptBox API
 

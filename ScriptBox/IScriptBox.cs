@@ -1,27 +1,24 @@
-using System;
+using ScriptBox.Core.Runtime;
 
 namespace ScriptBox;
 
 /// <summary>
-/// Represents a compiled ScriptBox runtime. Sessions created from the same
-/// instance share the underlying WASM module and host bridge configuration.
+/// A configured sandbox: the host APIs scripts can call and the limits they
+/// run under. Build one with <see cref="ScriptBoxBuilder"/> and keep it; each
+/// session is cheap.
 /// </summary>
-#if NET6_0_OR_GREATER
-public interface IScriptBox : IAsyncDisposable
+public interface IScriptBox
 {
-#else
-public interface IScriptBox : IDisposable
-{
-#endif
-    /// <summary>
-    /// Creates a new session for executing scripts.
-    /// </summary>
-    /// <param name="timeout">Optional timeout for the session. If not specified, uses the default timeout.</param>
-    /// <returns>A new script session.</returns>
-    ScriptSession CreateSession(TimeSpan? timeout = null);
+    ScriptSession CreateSession(Action<ScriptSessionOptions>? configure = null);
+
+    IReadOnlyList<SandboxApiDescriptor> Apis { get; }
+
+    IReadOnlyDictionary<string, object> Metadata { get; }
 
     /// <summary>
-    /// Gets metadata associated with this ScriptBox instance.
+    /// TypeScript declarations for every registered API and the types they
+    /// take and return, with descriptions as JSDoc. This is what to show the
+    /// model that writes scripts for this box.
     /// </summary>
-    IReadOnlyDictionary<string, object> Metadata { get; }
+    string GetTypeScriptDeclarations();
 }

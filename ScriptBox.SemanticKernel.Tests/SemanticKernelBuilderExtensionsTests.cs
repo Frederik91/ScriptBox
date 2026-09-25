@@ -13,14 +13,14 @@ public class SemanticKernelBuilderExtensionsTests
         var builder = ScriptBoxBuilder.Create();
         builder.RegisterApisFrom<SampleMathPlugin>("math_test");
 
-        await using var scriptBox = builder.Build();
+        var scriptBox = builder.Build();
 
         var metadata = scriptBox.GetSemanticKernelMetadata().Single();
         Assert.Equal("math_test", metadata.Name);
         Assert.Equal(2, metadata.Functions.Count);
         Assert.Contains(metadata.Functions, f => f.Name == "add" && f.Parameters.Count == 2);
 
-        await using var session = scriptBox.CreateSession();
+        var session = scriptBox.CreateSession();
         var result = await session.RunAsync("return math_test.add(3, 4);");
         Assert.Equal(7, Convert.ToInt32(result));
     }
