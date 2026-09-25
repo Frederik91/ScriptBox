@@ -1,33 +1,22 @@
-using System.Collections.Generic;
-using ScriptBox.Demo;
 using ScriptBox;
-using ScriptBox.Core.Configuration;
+using ScriptBox.Demo;
 
 Console.WriteLine("=== ScriptBox Demo ===");
 
-var sandboxDir = Path.Combine(Environment.CurrentDirectory, "sandbox");
-Directory.CreateDirectory(sandboxDir);
-
-var sandboxConfig = new SandboxConfiguration
-{
-    SandboxDirectory = sandboxDir,
-    StartupScripts = new List<string>()
-};
-
 var scriptBox = ScriptBoxBuilder
     .Create()
-    .WithSandboxConfiguration(sandboxConfig)
     .RegisterApisFrom(typeof(DemoCalculatorApi))
     .WithExecutionTimeout(TimeSpan.FromSeconds(5))
     .Build();
 
-var scriptPath = Path.Combine(AppContext.BaseDirectory, "scripts", "sample-script.js");
-var script = File.ReadAllText(scriptPath);
+Console.WriteLine(scriptBox.GetTypeScriptDeclarations());
 
-await using (scriptBox)
-await using (var session = scriptBox.CreateSession())
+var scriptPath = Path.Combine(AppContext.BaseDirectory, "scripts", "sample-script.js");
+var result = await scriptBox.CreateSession().ExecuteAsync(File.ReadAllText(scriptPath));
+
+foreach (var entry in result.Logs)
 {
-    await session.RunAsync(script);
+    Console.WriteLine($"[{entry.Level}] {entry.Message}");
 }
 
-Console.WriteLine("See sandbox/demo/result.txt for output.");
+Console.WriteLine(result.Succeeded ? $"Returned: {result.Json}" : $"Failed: {result.Error}");

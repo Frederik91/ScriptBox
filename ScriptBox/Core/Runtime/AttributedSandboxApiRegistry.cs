@@ -1,5 +1,4 @@
 using System.Diagnostics.CodeAnalysis;
-using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -19,80 +18,66 @@ internal static class AttributedSandboxApiRegistry
             }
 
             sb.AppendLine("(function(root){");
-            sb.AppendLine("  if (typeof __scriptbox === 'undefined') {");
-            sb.AppendLine("    throw new Error('Missing __scriptbox helper.');");
-            sb.AppendLine("  }");
             sb.AppendLine("  var api = {};");
             foreach (var method in api.Methods)
             {
-                sb.AppendLine($"  api.{method.JsMethodName} = __scriptbox.createMethod('{method.HostMethodName}');");
+                sb.AppendLine($"  api.{method.JsMethodName} = __scriptbox.createMethod({JsonSerializer.Serialize(method.HostMethodName)});");
             }
-            sb.AppendLine($"  root.{api.JsNamespace} = api;");
-            sb.Append("})(");
-            sb.Append("typeof globalThis !== 'undefined' ? globalThis : ");
-            sb.Append("typeof global !== 'undefined' ? global : ");
-            sb.Append("typeof self !== 'undefined' ? self : this");
-            sb.AppendLine(");");
+            sb.AppendLine($"  root.{api.JsNamespace} = Object.freeze(api);");
+            sb.AppendLine("})(globalThis);");
         }
 
         return sb.ToString();
     }
 
-    public static void RegisterHandlers(
-        IEnumerable<(SandboxApiDescriptor Descriptor, object? Instance)> apis,
-        HostApiBuilder builder,
-        Func<Type, object?>? resolveInstance)
+    public static void RegisterHandlers(IEnumerable<SandboxApiDescriptor> apis, HostApiBuilder builder)
     {
-        foreach (var (api, explicitInstance) in apis)
+        foreach (var api in apis)
         {
-            object? instance = explicitInstance;
-            if (api.RequiresInstance && instance is null)
-            {
-                var resolver = resolveInstance ?? DefaultInstanceFactory;
-                instance = resolver(api.ApiType);
-                if (instance is null)
-                {
-                    throw new InvalidOperationException($"API factory returned null for type {api.ApiType.FullName}.");
-                }
-            }
-
             foreach (var method in api.Methods)
             {
-                builder.RegisterJsonHandler(method.HostMethodName, CreateHandler(method, instance));
+                builder.RegisterHandler(method.HostMethodName, CreateHandler(api, method));
             }
         }
     }
 
-    private static object? DefaultInstanceFactory(Type type)
+    private static HostMethodHandler CreateHandler(SandboxApiDescriptor api, SandboxMethodDescriptor descriptor)
     {
-        var instance = Activator.CreateInstance(type);
-        if (instance is null)
-        {
-            throw new InvalidOperationException($"Failed to create instance of {type.FullName}.");
-        }
+        var declaredType = GetDeclaredResultType(descriptor.Method.ReturnType);
+        var parameters = descriptor.Method.GetParameters();
+        var nullability = parameters.Select(IsNullable).ToArray();
 
-        return instance;
-    }
-
-    private static Func<HostCallContext, Task<object?>> CreateHandler(
-        SandboxMethodDescriptor descriptor,
-        object? target)
-    {
         return async ctx =>
         {
-            var arguments = BindArguments(descriptor, ctx);
-            var result = descriptor.Method.Invoke(target, arguments);
-            return await UnwrapResultAsync(result);
+            var target = api.RequiresInstance ? ctx.ResolveInstance(api) : null;
+            var arguments = BindArguments(descriptor, parameters, nullability, ctx);
+
+            object? returned;
+            try
+            {
+                returned = descriptor.Method.Invoke(target, arguments);
+            }
+            catch (TargetInvocationException ex) when (ex.InnerException is not null)
+            {
+                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex.InnerException).Throw();
+                throw;
+            }
+
+            var value = await UnwrapResultAsync(returned).ConfigureAwait(false);
+            return new HostCallResult(value, declaredType);
         };
     }
 
-    private static object?[] BindArguments(SandboxMethodDescriptor descriptor, HostCallContext ctx)
+    private static object?[] BindArguments(
+        SandboxMethodDescriptor descriptor,
+        ParameterInfo[] parameters,
+        bool[] nullability,
+        HostCallContext ctx)
     {
-        var parameters = descriptor.Method.GetParameters();
         var values = new object?[parameters.Length];
         var argIndex = 0;
 
-        for (int i = 0; i < parameters.Length; i++)
+        for (var i = 0; i < parameters.Length; i++)
         {
             var parameter = parameters[i];
             if (parameter.ParameterType == typeof(HostCallContext))
@@ -107,48 +92,82 @@ internal static class AttributedSandboxApiRegistry
                 continue;
             }
 
-            if (argIndex >= ctx.Arguments.Count)
+            var supplied = argIndex < ctx.Arguments.Count ? ctx.Arguments[argIndex] : (JsonElement?)null;
+            argIndex++;
+
+            if (supplied is null || supplied.Value.ValueKind == JsonValueKind.Null)
             {
-                throw new InvalidOperationException(
-                    $"Not enough arguments supplied for method '{descriptor.HostMethodName}'. Expected {parameters.Length}");
+                if (parameter.HasDefaultValue)
+                {
+                    values[i] = parameter.DefaultValue;
+                }
+                else if (nullability[i])
+                {
+                    values[i] = null;
+                }
+                else
+                {
+                    throw new ScriptApiException(
+                        $"{descriptor.HostMethodName} requires the argument '{parameter.Name}'.", "TypeError");
+                }
+
+                continue;
             }
 
-            var raw = ctx.Arguments[argIndex++];
-            values[i] = ConvertValue(raw, parameter.ParameterType);
+            try
+            {
+                values[i] = supplied.Value.Deserialize(parameter.ParameterType, ctx.JsonOptions);
+            }
+            catch (JsonException ex)
+            {
+                throw new ScriptApiException(
+                    $"{descriptor.HostMethodName}: the argument '{parameter.Name}' is not a valid {parameter.ParameterType.Name}. {ex.Message}",
+                    "TypeError");
+            }
+        }
+
+        if (ctx.Arguments.Count > argIndex)
+        {
+            throw new ScriptApiException(
+                $"{descriptor.HostMethodName} takes {argIndex} argument(s) but was given {ctx.Arguments.Count}.",
+                "TypeError");
         }
 
         return values;
     }
 
-    private static object? ConvertValue(object? raw, Type targetType)
+    private static bool IsNullable(ParameterInfo parameter)
     {
-        if (raw is null)
+        var type = parameter.ParameterType;
+        if (type.IsValueType)
         {
-            return targetType.IsValueType ? Activator.CreateInstance(targetType) : null;
+            return Nullable.GetUnderlyingType(type) is not null;
         }
 
-        if (targetType.IsInstanceOfType(raw))
+#if NET6_0_OR_GREATER
+        return new NullabilityInfoContext().Create(parameter).WriteState != NullabilityState.NotNull;
+#else
+        return true;
+#endif
+    }
+
+    internal static Type GetDeclaredResultType(Type returnType)
+    {
+        if (returnType == typeof(void) || returnType == typeof(Task) || returnType == typeof(ValueTask))
         {
-            return raw;
+            return typeof(void);
         }
 
-        if (raw is JsonElement element)
+        if (returnType.IsGenericType)
         {
-            var json = element.GetRawText();
-            return JsonSerializer.Deserialize(json, targetType);
-        }
-
-        if (targetType.IsEnum)
-        {
-            if (raw is string enumName)
+            var definition = returnType.GetGenericTypeDefinition();
+            if (definition == typeof(Task<>) || definition == typeof(ValueTask<>))
             {
-                return Enum.Parse(targetType, enumName, ignoreCase: true);
+                return returnType.GetGenericArguments()[0];
             }
-
-            return Enum.ToObject(targetType, raw);
         }
 
-        return Convert.ChangeType(raw, targetType, CultureInfo.InvariantCulture);
+        return returnType;
     }
 
     private static async Task<object?> UnwrapResultAsync(object? result)
@@ -157,68 +176,35 @@ internal static class AttributedSandboxApiRegistry
         {
             case null:
                 return null;
-            case Task task when task.GetType().IsGenericType:
-                await task.ConfigureAwait(false);
-                return GetTaskResult(task);
             case Task task:
                 await task.ConfigureAwait(false);
-                return null;
+                return task.GetType().IsGenericType ? GetTaskResult(task) : null;
             case ValueTask valueTask:
-#if NET6_0_OR_GREATER
-                await valueTask.ConfigureAwait(false);
-#else
                 await valueTask.AsTask().ConfigureAwait(false);
-#endif
                 return null;
-            default:
-                var type = result.GetType();
-                var fullName = type.FullName;
-                if (!string.IsNullOrEmpty(fullName) && fullName.StartsWith("System.Threading.Tasks.ValueTask`1", StringComparison.Ordinal))
-                {
-                    var asTaskMethod = type.GetMethod("AsTask", BindingFlags.Public | BindingFlags.Instance);
-                    if (asTaskMethod != null)
-                    {
-                        if (asTaskMethod.Invoke(result, null) is Task task)
-                        {
-                            await task.ConfigureAwait(false);
-                            return GetTaskResult(task);
-                        }
-                    }
-                }
-
-                return result;
         }
+
+        var type = result.GetType();
+        if (type.IsGenericType && type.GetGenericTypeDefinition() == typeof(ValueTask<>))
+        {
+            var task = (Task)type.GetMethod("AsTask")!.Invoke(result, null)!;
+            await task.ConfigureAwait(false);
+            return GetTaskResult(task);
+        }
+
+        return result;
     }
 
     private static object? GetTaskResult(Task task)
     {
-        var taskType = task.GetType();
-        var resultProperty = taskType.GetProperty("Result", BindingFlags.Instance | BindingFlags.Public);
-        return resultProperty?.GetValue(task);
-    }
-
-    public static IReadOnlyList<SandboxApiDescriptor> DiscoverApis(IEnumerable<Assembly> assemblies)
-    {
-        var descriptors = new List<SandboxApiDescriptor>();
-        foreach (var assembly in assemblies)
-        {
-            foreach (var type in assembly.GetTypes())
-            {
-                if (TryCreateDescriptor(type, null, out var descriptor))
-                {
-                    descriptors.Add(descriptor);
-                }
-            }
-        }
-
-        return descriptors;
+        return task.GetType().GetProperty("Result", BindingFlags.Instance | BindingFlags.Public)?.GetValue(task);
     }
 
     public static bool TryCreateDescriptor(Type type, string? namespaceOverride, [NotNullWhen(true)] out SandboxApiDescriptor? descriptor)
     {
         descriptor = null;
 
-        string? apiName = namespaceOverride;
+        var apiName = namespaceOverride;
         if (apiName is null)
         {
             var apiAttribute = type.GetCustomAttribute<SandboxApiAttribute>();
@@ -230,36 +216,19 @@ internal static class AttributedSandboxApiRegistry
         }
 
         var isStatic = type.IsAbstract && type.IsSealed;
-
-        var methods = new List<SandboxMethodDescriptor>();
-        foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly))
-        {
-            var methodAttribute = method.GetCustomAttribute<SandboxMethodAttribute>();
-            if (methodAttribute is null)
-            {
-                continue;
-            }
-
-            methods.Add(new SandboxMethodDescriptor(
-                apiName,
-                methodAttribute.Name,
-                method));
-        }
-
+        var flags = BindingFlags.Public | BindingFlags.Static | BindingFlags.DeclaredOnly;
         if (!isStatic)
         {
-            foreach (var method in type.GetMethods(BindingFlags.Public | BindingFlags.Instance | BindingFlags.DeclaredOnly))
-            {
-                var methodAttribute = method.GetCustomAttribute<SandboxMethodAttribute>();
-                if (methodAttribute is null)
-                {
-                    continue;
-                }
+            flags |= BindingFlags.Instance;
+        }
 
-                methods.Add(new SandboxMethodDescriptor(
-                    apiName,
-                    methodAttribute.Name,
-                    method));
+        var methods = new List<SandboxMethodDescriptor>();
+        foreach (var method in type.GetMethods(flags))
+        {
+            var methodAttribute = method.GetCustomAttribute<SandboxMethodAttribute>();
+            if (methodAttribute is not null)
+            {
+                methods.Add(new SandboxMethodDescriptor(apiName, methodAttribute.Name, method));
             }
         }
 
@@ -268,9 +237,8 @@ internal static class AttributedSandboxApiRegistry
             return false;
         }
 
-        descriptor = new SandboxApiDescriptor(type, apiName, methods, RequiresInstance: !isStatic);
-
+        var requiresInstance = methods.Any(m => !m.Method.IsStatic);
+        descriptor = new SandboxApiDescriptor(type, apiName, methods, requiresInstance);
         return true;
     }
 }
-

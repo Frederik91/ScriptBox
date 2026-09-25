@@ -21,8 +21,8 @@ public class SemanticKernelScannerTests
             .WithApiScanner(new SemanticKernelApiScanner())
             .RegisterApisFrom<MySkPlugin>();
 
-        await using var box = builder.Build();
-        await using var session = box.CreateSession();
+        var box = builder.Build();
+        var session = box.CreateSession();
 
         var result = await session.RunAsync("return sk_plugin.add(10, 20);");
         Assert.Equal("30", result);
@@ -36,8 +36,8 @@ public class SemanticKernelScannerTests
         var builder = ScriptBoxBuilder.Create()
             .RegisterApisFrom<MySkPlugin>(); // No explicit WithApiScanner call!
 
-        await using var box = builder.Build();
-        await using var session = box.CreateSession();
+        var box = builder.Build();
+        var session = box.CreateSession();
 
         var result = await session.RunAsync("return sk_plugin.add(15, 25);");
         Assert.Equal("40", result);
@@ -51,7 +51,7 @@ public class SemanticKernelScannerTests
         var builder = ScriptBoxBuilder.Create()
             .RegisterApisFrom<MySkPlugin>(); // Metadata should be automatically stored
 
-        await using var box = builder.Build();
+        var box = builder.Build();
 
         // Retrieve metadata using extension method
         var metadata = box.GetSemanticKernelMetadata();

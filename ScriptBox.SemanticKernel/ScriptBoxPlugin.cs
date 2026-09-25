@@ -43,8 +43,8 @@ public sealed class ScriptBoxPlugin
             throw new ArgumentException("Code must be provided.", nameof(code));
         }
 
-        await using var session = _scriptBox.CreateSession();
-        
+        var session = _scriptBox.CreateSession();
+
         // Discover tools and merge with user input
         var tools = _toolProvider.GetTools();
         var scriptBoxInput = BuildScriptBoxInput(inputJson, tools);
@@ -55,8 +55,9 @@ public sealed class ScriptBoxPlugin
         
         var output = new
         {
-            result = ParseResult(executionResult.Result),
-            logs = executionResult.Logs
+            result = ParseResult(executionResult.Json),
+            error = executionResult.Error?.ToString(),
+            logs = executionResult.Logs.Select(entry => entry.Message).ToList()
         };
 
         return JsonSerializer.Serialize(output, SerializerOptions);

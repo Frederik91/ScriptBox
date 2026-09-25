@@ -36,16 +36,11 @@ The repository is organized as a Visual Studio solution (`ScriptBox.sln`) contai
 
 Understanding the data flow is crucial for modifying the system:
 
-1.  **Host (C#)**: The .NET application configures a `ScriptBox` instance using `ScriptBoxBuilder`. It registers C# classes as APIs.
-2.  **WASM Runtime**: ScriptBox loads a pre-compiled `scriptbox.wasm` module (QuickJS compiled to WASM).
-3.  **Initialization**: When a session starts, ScriptBox injects a bootstrap script (`scriptbox.js`) into the WASM runtime. This script sets up the `__scriptbox` global.
-4.  **Execution**:
-    *   The Host calls `RunAsync(script)`.
-    *   The script is written to WASM memory.
-    *   QuickJS evaluates the script.
-5.  **Interop (RPC)**:
-    *   **JS to Host**: The script calls `__scriptbox.hostCall('Namespace.Method', args)`. This triggers a host function import in WASM, which routes the call back to the registered C# method.
-    *   **Host to JS**: The Host receives the call, executes the C# method, and returns the result (serialized as JSON) back to WASM.
+1.  **Host (C#)**: The .NET application configures a `ScriptBox` instance using `ScriptBoxBuilder`. It registers C# classes as APIs. Nothing else is reachable from a script: there is no built-in file system or network API.
+2.  **WASM Runtime**: `WasmRuntime` compiles `scriptbox.wasm` (QuickJS compiled to WASM) once per process and shares it.
+3.  **Execution**: `ScriptSession.ExecuteAsync` runs on a dedicated 16 MB-stack thread. Each execution gets a fresh WASM instance, evaluates the bootstrap scripts (`scriptbox.js`, the generated `apis.js`, then any startup scripts) and finally the user script as `script.js`, wrapped in an async function in strict mode.
+4.  **Interop**: the guest ABI is documented at the top of `ScriptBox.Wasm/scriptbox_wrapper.c`. A script calls `ns.method(...)`, which `scriptbox.js` sends through `__host.call` as JSON; the host binds the arguments to the C# parameters, invokes the method and returns `{result}` or `{error}`. There are no fixed-size buffers in either direction.
+5.  **Limits**: on timeout or cancellation the host traps the instance from `host.interrupt` (polled by QuickJS) or `host.call`, which no script can catch. A Wasmtime epoch deadline backs that up for native code that never polls. Memory is capped with Wasmtime store limits. A changed C file means rebuilding the WASM with `ScriptBox.Wasm/build.sh` (WASI SDK 28).
 
 ## 4. Development Workflow
 

@@ -106,7 +106,7 @@ cd "$QUICKJS_DIR"
 if ! grep -q "__wasi__" quickjs.c; then
     # Use sed to find the _WIN32 section and add __wasi__ case after it
     # Note: Using printf for cross-platform newline handling
-    sed -i.bak '/#elif defined(_WIN32)/a\
+    sed -i.bak '/#elif defined(_WIN32)/i\
 #elif defined(__wasi__)\
     return 0;' quickjs.c || true
 fi
@@ -129,14 +129,13 @@ echo ""
 echo "🔨 Compiling QuickJS + scriptbox_wrapper.c to WASM..."
 echo ""
 
-# Compile to WASM with minimal optimizations for stable build
-# Use -Wno-error to convert errors to warnings for compatibility
-# NOTE: Using -O0 to diagnose if aggressive size optimization (-Oz) is causing stack overflow
+# -O2 matters: QuickJS is an interpreter, so its speed is the script's speed.
+# The 8 MB stack is what sb_init's JS_SetMaxStackSize is sized against.
 $CLANG \
     --target=wasm32-wasi \
     -I "$QUICKJS_DIR" \
     -I "$WASI_SDK_PATH/include" \
-    -O0 \
+    -O2 \
     -Wall \
     -Wno-error=implicit-function-declaration \
     -Wno-error=format \
@@ -152,14 +151,11 @@ $CLANG \
     "$QUICKJS_DIR/dtoa.c" \
     "$SCRIPT_DIR/scriptbox_wrapper.c" \
     -o "$OUTPUT" \
-    -Wl,--export=eval_js \
-    -Wl,--export=quickjs_selftest \
-    -Wl,--export=get_last_error_ptr \
-    -Wl,--export=get_last_error_len \
-    -Wl,--export=get_result_ptr \
-    -Wl,--export=get_result_len \
-    -Wl,--export=get_script_buffer_ptr \
-    -Wl,--export=get_script_buffer_len \
+    -Wl,--export=sb_init \
+    -Wl,--export=sb_eval \
+    -Wl,--export=sb_alloc \
+    -Wl,--export=sb_free \
+    -Wl,-z,stack-size=8388608 \
     -Wl,--no-entry \
     -Wl,--strip-all
 
@@ -172,9 +168,7 @@ if [ $? -eq 0 ]; then
     echo "📊 Size: ${SIZE_KB}KB"
     echo "🔧 WASI SDK: $WASI_SDK_PATH"
     echo ""
-    echo "Next steps:"
-    echo "  1. Rebuild ScriptBox: dotnet build ScriptBox/ScriptBox.csproj"
-    echo "  2. Run the demo: dotnet run --project ScriptBox.Demo/ScriptBox.Demo.csproj"
+    echo "Next step: dotnet test ScriptBox.sln"
 else
     echo ""
     echo "❌ Build failed!"

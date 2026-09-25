@@ -21,8 +21,8 @@ public class SemanticKernelScannerRefactorTests
             .WithApiScanner(new SemanticKernelApiScanner())
             .RegisterApisFrom<VanillaSkPlugin>(); // Should default to "vanilla_sk_plugin"
 
-        await using var box = builder.Build();
-        await using var session = box.CreateSession();
+        var box = builder.Build();
+        var session = box.CreateSession();
 
         var result = await session.RunAsync("return vanilla_sk_plugin.multiply(10, 20);");
         Assert.Equal("200", result);
@@ -35,8 +35,8 @@ public class SemanticKernelScannerRefactorTests
             .WithApiScanner(new SemanticKernelApiScanner())
             .RegisterApisFrom<VanillaSkPlugin>("my_math");
 
-        await using var box = builder.Build();
-        await using var session = box.CreateSession();
+        var box = builder.Build();
+        var session = box.CreateSession();
 
         var result = await session.RunAsync("return my_math.multiply(5, 5);");
         Assert.Equal("25", result);

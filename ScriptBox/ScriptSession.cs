@@ -1,103 +1,111 @@
-using System;
 using System.Threading;
-using System.Threading.Tasks;
 using ScriptBox.Core.WasmExecution;
 
 namespace ScriptBox;
 
 /// <summary>
-/// Represents an isolated execution context for running user scripts.
+/// A context for running scripts against one set of host API instances.
+/// Every execution still starts from a fresh JavaScript realm: nothing a
+/// script defines survives into the next one. What a session carries across
+/// executions is host-side state, in its API instances and <see cref="Items"/>.
 /// </summary>
-public sealed class ScriptSession : IAsyncDisposable
+public sealed class ScriptSession
 {
-    private readonly IWasmScriptExecutor _executor;
-    private readonly string _bootstrapCode;
-    private readonly TimeSpan _timeout;
+    private readonly ScriptBox _box;
 
-    internal ScriptSession(
-        IWasmScriptExecutor executor,
-        string bootstrapCode,
-        TimeSpan timeout)
+    internal ScriptSession(ScriptBox box, ScriptSessionOptions options)
     {
-        _executor = executor ?? throw new ArgumentNullException(nameof(executor));
-        _bootstrapCode = bootstrapCode ?? string.Empty;
-        _timeout = timeout;
+        _box = box;
+        Timeout = options.Timeout ?? box.DefaultTimeout;
+        if (Timeout < TimeSpan.Zero || Timeout.TotalMilliseconds > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(options), "The session timeout must be zero (no limit) or a positive span under 24 days.");
+        }
+
+        ApiOverrides = box.ResolveSessionApis(options.Apis);
     }
 
-    public Task<object?> RunAsync(string userScript, CancellationToken cancellationToken = default)
+    public TimeSpan Timeout { get; }
+
+    /// <summary>State host APIs can share for the lifetime of the session, safe to use from concurrent executions.</summary>
+    public IDictionary<string, object?> Items { get; } = new System.Collections.Concurrent.ConcurrentDictionary<string, object?>(StringComparer.Ordinal);
+
+    internal IReadOnlyDictionary<string, object> ApiOverrides { get; }
+
+    /// <summary>
+    /// Runs a script and reports its outcome, including failures. The script
+    /// is the body of an async function: use <c>return</c> to produce a value,
+    /// and <c>await</c> freely.
+    /// </summary>
+    /// <exception cref="OperationCanceledException">The token was cancelled.</exception>
+    public Task<ScriptExecutionResult> ExecuteAsync(string script, CancellationToken cancellationToken = default)
     {
-        if (userScript is null)
+        if (script is null)
         {
-            throw new ArgumentNullException(nameof(userScript));
+            throw new ArgumentNullException(nameof(script));
         }
 
         cancellationToken.ThrowIfCancellationRequested();
 
-        var script = string.IsNullOrWhiteSpace(_bootstrapCode)
-            ? userScript
-            : string.Concat(_bootstrapCode, "\n", userScript);
-
-        var timeoutMs = ConvertTimeoutToMilliseconds(_timeout);
-        var executionResult = _executor.ExecuteScript(script, timeoutMs);
-
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult<object?>(executionResult.Result);
+        // A dedicated thread, because the execution blocks it throughout, and
+        // one with a large stack, because WASM runs on it.
+        var completion = new TaskCompletionSource<ScriptExecutionResult>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var thread = new Thread(
+            () =>
+            {
+                try
+                {
+                    completion.SetResult(_box.Execute(this, script, cancellationToken));
+                }
+                catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+                {
+                    completion.SetCanceled();
+                }
+                catch (Exception ex)
+                {
+                    completion.SetException(ex);
+                }
+            },
+            WasmRuntime.ExecutionThreadStackSize)
+        {
+            IsBackground = true,
+            Name = "ScriptBox execution",
+        };
+        thread.Start();
+        return completion.Task;
     }
 
     /// <summary>
-    /// Executes a script and returns the result along with any console logs captured during execution.
+    /// Runs a script and returns its value as JSON, or null for undefined.
     /// </summary>
-    /// <param name="userScript">The script to execute.</param>
-    /// <param name="cancellationToken">Cancellation token.</param>
-    /// <returns>A result containing the return value and logs.</returns>
-    public Task<ScriptExecutionResult> ExecuteAsync(string userScript, CancellationToken cancellationToken = default)
+    /// <exception cref="ScriptException">The script did not complete.</exception>
+    public async Task<string?> RunAsync(string script, CancellationToken cancellationToken = default)
     {
-        if (userScript is null)
+        var result = await ExecuteAsync(script, cancellationToken).ConfigureAwait(false);
+        if (result.Error is not null)
         {
-            throw new ArgumentNullException(nameof(userScript));
+            throw new ScriptException(result.Error);
         }
 
-        cancellationToken.ThrowIfCancellationRequested();
-
-        var script = string.IsNullOrWhiteSpace(_bootstrapCode)
-            ? userScript
-            : string.Concat(_bootstrapCode, "\n", userScript);
-
-        var timeoutMs = ConvertTimeoutToMilliseconds(_timeout);
-        var executionResult = _executor.ExecuteScript(script, timeoutMs);
-
-        cancellationToken.ThrowIfCancellationRequested();
-        return Task.FromResult(new ScriptExecutionResult
-        {
-            Result = executionResult.Result,
-            Logs = executionResult.Logs
-        });
+        return result.Json;
     }
+}
 
-    public ValueTask DisposeAsync()
+public sealed class ScriptSessionOptions
+{
+    internal List<(object Instance, string? Namespace)> Apis { get; } = new();
+
+    /// <summary>Overrides the box's execution timeout for this session.</summary>
+    public TimeSpan? Timeout { get; set; }
+
+    /// <summary>
+    /// Serves a registered API from this instance for the session, in place of
+    /// the box-wide one. The instance's type must match exactly one registered
+    /// API, or the one named by <paramref name="jsNamespace"/>.
+    /// </summary>
+    public ScriptSessionOptions UseApi(object instance, string? jsNamespace = null)
     {
-#if NETSTANDARD2_0
-        return default;
-#elif NETSTANDARD2_1
-        return new ValueTask(Task.CompletedTask);
-#else
-        return ValueTask.CompletedTask;
-#endif
-    }
-
-    private static int? ConvertTimeoutToMilliseconds(TimeSpan timeout)
-    {
-        if (timeout <= TimeSpan.Zero)
-        {
-            return null;
-        }
-
-        var ms = timeout.TotalMilliseconds;
-        if (ms >= int.MaxValue)
-        {
-            return int.MaxValue;
-        }
-
-        return (int)Math.Ceiling(ms);
+        Apis.Add((instance ?? throw new ArgumentNullException(nameof(instance)), jsNamespace));
+        return this;
     }
 }

@@ -20,9 +20,9 @@ public class SemanticKernelIntegrationTests
     {
         var builder = ScriptBoxBuilder.Create();
         builder.RegisterApisFrom<TestSemanticKernelPlugin>("math");
-        await using var scriptBox = builder.Build();
+        var scriptBox = builder.Build();
 
-        await using var session = scriptBox.CreateSession();
+        var session = scriptBox.CreateSession();
         var result = await session.RunAsync("return math.add(4, 6);");
         Assert.Equal(10, Convert.ToInt32(result));
     }
@@ -44,7 +44,7 @@ public class SemanticKernelIntegrationTests
     [Fact]
     public async Task ScriptBoxPlugin_RunJavaScriptAsync_ReturnsSerializedResult()
     {
-        await using var scriptBox = ScriptBoxBuilder.Create().Build();
+        var scriptBox = ScriptBoxBuilder.Create().Build();
         var toolProvider = CreateEmptyToolProvider();
         var plugin = new ScriptBoxPlugin(scriptBox, toolProvider);
 
@@ -58,7 +58,7 @@ public class SemanticKernelIntegrationTests
     [Fact]
     public async Task ScriptBoxPlugin_PassesInputPayload()
     {
-        await using var scriptBox = ScriptBoxBuilder.Create().Build();
+        var scriptBox = ScriptBoxBuilder.Create().Build();
         var toolProvider = CreateEmptyToolProvider();
         var plugin = new ScriptBoxPlugin(scriptBox, toolProvider);
 

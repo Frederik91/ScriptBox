@@ -15,7 +15,7 @@ public class ScriptBoxPluginTests
     [Fact]
     public async Task RunJavaScriptAsync_ReturnsSerializedObject()
     {
-        await using var box = ScriptBoxBuilder.Create().Build();
+        var box = ScriptBoxBuilder.Create().Build();
         var toolProvider = CreateEmptyToolProvider();
         var plugin = new ScriptBoxPlugin(box, toolProvider);
 
@@ -28,7 +28,7 @@ public class ScriptBoxPluginTests
     [Fact]
     public async Task RunJavaScriptAsync_IncludesInputPayload()
     {
-        await using var box = ScriptBoxBuilder.Create().Build();
+        var box = ScriptBoxBuilder.Create().Build();
         var toolProvider = CreateEmptyToolProvider();
         var plugin = new ScriptBoxPlugin(box, toolProvider);
 
@@ -41,7 +41,7 @@ public class ScriptBoxPluginTests
     [Fact]
     public async Task RunJavaScriptAsync_InvalidJson_Throws()
     {
-        await using var box = ScriptBoxBuilder.Create().Build();
+        var box = ScriptBoxBuilder.Create().Build();
         var toolProvider = CreateEmptyToolProvider();
         var plugin = new ScriptBoxPlugin(box, toolProvider);
 

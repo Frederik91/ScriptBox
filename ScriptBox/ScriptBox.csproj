@@ -33,8 +33,8 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0' or '$(TargetFramework)' == 'netstandard2.1'">
-    <PackageReference Include="System.Text.Json" Version="4.6.0" />
-    <PackageReference Include="System.Text.Encodings.Web" Version="4.6.0" NoWarn="NU1904"/>
+    <PackageReference Include="System.Text.Json" Version="8.0.6" />
+    <PackageReference Include="System.Text.Encodings.Web" Version="8.0.0" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'net8.0'">
@@ -52,28 +52,7 @@
     <PackageReference Include="System.Text.Encodings.Web" Version="10.0.0" />
   </ItemGroup>
 
-  <!-- Copy the custom-built QuickJS WASM module to output directory.
-       The module is built by running: bash wasm/build.sh -->
-  <ItemGroup>
-    <Content Include="..\ScriptBox.Wasm\scriptbox.wasm" Condition="Exists('..\ScriptBox.Wasm\scriptbox.wasm')">
-      <Pack>false</Pack>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>scriptbox.wasm</Link>
-    </Content>
-    
-    <!-- Copy the scriptbox bootstrap to output directory -->
-    <Content Include="..\scripts\sdk\scriptbox.js" Condition="Exists('..\scripts\sdk\scriptbox.js')">
-      <Pack>false</Pack>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>scripts\scriptbox.js</Link>
-    </Content>
-    <Content Include="..\scripts\scriptbox-api.js" Condition="Exists('..\scripts\scriptbox-api.js')">
-      <Pack>false</Pack>
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-      <Link>scripts\scriptbox-api.js</Link>
-    </Content>
-  </ItemGroup>
-
+  <!-- The module is built with ScriptBox.Wasm/build.sh; both it and the bootstrap are loaded from these resources. -->
   <ItemGroup>
     <EmbeddedResource Include="..\scripts\sdk\scriptbox.js" Condition="Exists('..\scripts\sdk\scriptbox.js')" LogicalName="ScriptBox.Js.sandbox-api.js" />
     <EmbeddedResource Include="..\scripts\dist\sdk\bootstrap-utils.js" Condition="Exists('..\scripts\dist\sdk\bootstrap-utils.js')" LogicalName="ScriptBox.Js.bootstrap-utils.js" />
