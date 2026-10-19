@@ -412,11 +412,11 @@ internal sealed class WasmScriptExecutor
             }
 
             var context = new HostCallContext(
-                hostMethod.Api, hostMethod.Descriptor, arguments, _session, _owner._jsonOptions, _resolveInstance, _token);
+                hostMethod.Api, hostMethod.Descriptor, arguments, _session, hostMethod.Api.JsonOptions ?? _owner._jsonOptions, _resolveInstance, _token);
             try
             {
                 var result = Invoke(hostMethod, context).GetAwaiter().GetResult();
-                return ResultResponse(result);
+                return ResultResponse(result, context.JsonOptions);
             }
             catch (OperationCanceledException) when (InterruptRequested)
             {
@@ -441,7 +441,7 @@ internal sealed class WasmScriptExecutor
             return Next(0);
         }
 
-        private byte[] ResultResponse(HostCallResult result)
+        private static byte[] ResultResponse(HostCallResult result, JsonSerializerOptions options)
         {
             using var buffer = new MemoryStream();
             using (var writer = new Utf8JsonWriter(buffer))
@@ -457,7 +457,7 @@ internal sealed class WasmScriptExecutor
                     var type = result.DeclaredType == typeof(object) || result.DeclaredType == typeof(void)
                         ? result.Value.GetType()
                         : result.DeclaredType;
-                    JsonSerializer.Serialize(writer, result.Value, type, _owner._jsonOptions);
+                    JsonSerializer.Serialize(writer, result.Value, type, options);
                 }
                 writer.WriteEndObject();
             }

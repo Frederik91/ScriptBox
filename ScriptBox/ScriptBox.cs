@@ -39,9 +39,7 @@ public sealed class ScriptBox : IScriptBox
         _jsonOptions = jsonOptions;
         Metadata = metadata;
         _typeOverrides = typeOverrides;
-        _declarations = new Lazy<string>(
-            () => new TypeScriptDeclarationGenerator(jsonOptions, typeOverrides).Generate(apis),
-            LazyThreadSafetyMode.ExecutionAndPublication);
+        _declarations = new Lazy<string>(() => Declare(_ => true), LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
     public IReadOnlyList<SandboxApiDescriptor> Apis { get; }
@@ -60,7 +58,14 @@ public sealed class ScriptBox : IScriptBox
     public string GetTypeScriptDeclarations() => _declarations.Value;
 
     public string GetTypeScriptDeclarations(Func<SandboxMethodDescriptor, bool> include) =>
-        new TypeScriptDeclarationGenerator(_jsonOptions, _typeOverrides).Generate(Apis, include ?? throw new ArgumentNullException(nameof(include)));
+        Declare(include ?? throw new ArgumentNullException(nameof(include)));
+
+    // APIs registered with their own serializer are declared by a generator of their own, so their shapes are the ones sent.
+    private string Declare(Func<SandboxMethodDescriptor, bool> include) =>
+        string.Concat(Apis
+            .GroupBy(api => api.JsonOptions ?? _jsonOptions)
+            .Select(group => new TypeScriptDeclarationGenerator(group.Key, _typeOverrides).Generate(group, include))
+            .Where(text => text.Trim().Length > 0));
 
     internal ScriptExecutionResult Execute(ScriptSession session, string script, CancellationToken cancellationToken)
     {

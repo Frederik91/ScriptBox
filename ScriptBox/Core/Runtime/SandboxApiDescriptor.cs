@@ -1,5 +1,6 @@
 using System.ComponentModel;
 using System.Reflection;
+using System.Text.Json;
 
 namespace ScriptBox.Core.Runtime;
 
@@ -14,6 +15,12 @@ public sealed record SandboxApiDescriptor(
 {
     /// <summary>The API's <see cref="DescriptionAttribute"/>, if it has one.</summary>
     public string? Description => ApiType.GetCustomAttribute<DescriptionAttribute>()?.Description;
+
+    /// <summary>
+    /// The serializer for this API's arguments, results and declarations. A built box sets it on every API, to the
+    /// options the API was registered with or else the box's own.
+    /// </summary>
+    public JsonSerializerOptions? JsonOptions { get; init; }
 }
 
 /// <summary>

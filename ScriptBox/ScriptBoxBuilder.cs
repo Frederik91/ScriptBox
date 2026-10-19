@@ -37,8 +37,8 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     private static readonly object _scannerLock = new();
 
     private readonly List<Func<CancellationToken, Task<string>>> _startupScriptLoaders = new();
-    private readonly List<(Type Type, string? Namespace)> _registeredApiTypes = new();
-    private readonly List<(object Instance, string? Namespace)> _registeredApiInstances = new();
+    private readonly List<(Type Type, string? Namespace, JsonSerializerOptions? Json)> _registeredApiTypes = new();
+    private readonly List<(object Instance, string? Namespace, JsonSerializerOptions? Json)> _registeredApiInstances = new();
     private readonly Dictionary<string, object> _metadata = new();
     private readonly List<ISandboxApiScanner> _apiScanners = new();
     private readonly Dictionary<Type, string> _typeScriptOverrides = new();
@@ -240,7 +240,16 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
 
     public ScriptBoxBuilder RegisterApisFrom(Type type, string? name = null)
     {
-        _registeredApiTypes.Add((type ?? throw new ArgumentNullException(nameof(type)), name));
+        return RegisterApisFrom(type, name, null);
+    }
+
+    /// <summary>
+    /// Registers an API whose arguments, results and declarations use <paramref name="jsonOptions"/> instead of
+    /// the box's options, so APIs written against different serializers can share one box.
+    /// </summary>
+    public ScriptBoxBuilder RegisterApisFrom(Type type, string? name, JsonSerializerOptions? jsonOptions)
+    {
+        _registeredApiTypes.Add((type ?? throw new ArgumentNullException(nameof(type)), name, jsonOptions));
         return this;
     }
 
@@ -248,7 +257,13 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
 
     public ScriptBoxBuilder AddFromObject(object instance, string? name = null)
     {
-        _registeredApiInstances.Add((instance ?? throw new ArgumentNullException(nameof(instance)), name));
+        return AddFromObject(instance, name, null);
+    }
+
+    /// <inheritdoc cref="RegisterApisFrom(Type, string?, JsonSerializerOptions?)"/>
+    public ScriptBoxBuilder AddFromObject(object instance, string? name, JsonSerializerOptions? jsonOptions)
+    {
+        _registeredApiInstances.Add((instance ?? throw new ArgumentNullException(nameof(instance)), name, jsonOptions));
         return this;
     }
 
@@ -306,16 +321,17 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     {
         EnsureDefaultScannersLoaded();
 
+        var jsonOptions = _jsonOptions ?? ScriptBoxJson.CreateDefaultOptions();
         var apis = new List<SandboxApiDescriptor>();
         var fixedInstances = new Dictionary<string, object>(StringComparer.Ordinal);
-        foreach (var (type, ns) in _registeredApiTypes.Distinct())
+        foreach (var (type, ns, json) in _registeredApiTypes.Distinct())
         {
-            apis.Add(Describe(type, ns));
+            apis.Add(Describe(type, ns) with { JsonOptions = json ?? jsonOptions });
         }
 
-        foreach (var (instance, ns) in _registeredApiInstances)
+        foreach (var (instance, ns, json) in _registeredApiInstances)
         {
-            var descriptor = Describe(instance.GetType(), ns);
+            var descriptor = Describe(instance.GetType(), ns) with { JsonOptions = json ?? jsonOptions };
             apis.Add(descriptor);
             fixedInstances[descriptor.JsNamespace] = instance;
         }
@@ -338,7 +354,6 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
         var handlers = new HostApiBuilder();
         AttributedSandboxApiRegistry.RegisterHandlers(apis, handlers);
 
-        var jsonOptions = _jsonOptions ?? ScriptBoxJson.CreateDefaultOptions();
         var executor = new WasmScriptExecutor(ResolveModule(), handlers.Build(), _filters.ToArray(), jsonOptions);
         var limits = new ExecutionLimits
         {
