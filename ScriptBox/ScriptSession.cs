@@ -23,6 +23,7 @@ public sealed class ScriptSession
         }
 
         ApiOverrides = box.ResolveSessionApis(options.Apis);
+        Filters = options.Filters.ToArray();
     }
 
     public TimeSpan Timeout { get; }
@@ -31,6 +32,8 @@ public sealed class ScriptSession
     public IDictionary<string, object?> Items { get; } = new System.Collections.Concurrent.ConcurrentDictionary<string, object?>(StringComparer.Ordinal);
 
     internal IReadOnlyDictionary<string, object> ApiOverrides { get; }
+
+    internal IReadOnlyList<Core.Runtime.IHostCallFilter> Filters { get; }
 
     /// <summary>
     /// Runs a script and reports its outcome, including failures. The script
@@ -95,6 +98,8 @@ public sealed class ScriptSessionOptions
 {
     internal List<(object Instance, string? Namespace)> Apis { get; } = new();
 
+    internal List<Core.Runtime.IHostCallFilter> Filters { get; } = new();
+
     /// <summary>Overrides the box's execution timeout for this session.</summary>
     public TimeSpan? Timeout { get; set; }
 
@@ -106,6 +111,15 @@ public sealed class ScriptSessionOptions
     public ScriptSessionOptions UseApi(object instance, string? jsNamespace = null)
     {
         Apis.Add((instance ?? throw new ArgumentNullException(nameof(instance)), jsNamespace));
+        return this;
+    }
+
+    /// <summary>
+    /// Runs <paramref name="filter"/> around every host call in this session, inside the box's own filters.
+    /// </summary>
+    public ScriptSessionOptions UseHostCallFilter(Core.Runtime.IHostCallFilter filter)
+    {
+        Filters.Add(filter ?? throw new ArgumentNullException(nameof(filter)));
         return this;
     }
 }

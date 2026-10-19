@@ -36,7 +36,7 @@ internal static class AttributedSandboxApiRegistry
         {
             foreach (var method in api.Methods)
             {
-                builder.RegisterHandler(method.HostMethodName, CreateHandler(api, method));
+                builder.Register(api, method, CreateHandler(api, method));
             }
         }
     }

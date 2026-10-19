@@ -12,14 +12,16 @@ public sealed class HostCallContext
     private readonly Func<SandboxApiDescriptor, object> _resolveInstance;
 
     internal HostCallContext(
-        string method,
+        SandboxApiDescriptor api,
+        SandboxMethodDescriptor method,
         IReadOnlyList<JsonElement> arguments,
         ScriptSession session,
         JsonSerializerOptions jsonOptions,
         Func<SandboxApiDescriptor, object> resolveInstance,
         CancellationToken cancellationToken)
     {
-        Method = method;
+        Api = api;
+        MethodDescriptor = method;
         Arguments = arguments;
         Session = session;
         JsonOptions = jsonOptions;
@@ -28,7 +30,11 @@ public sealed class HostCallContext
     }
 
     /// <summary>The called method as the script names it, e.g. <c>tasks.get</c>.</summary>
-    public string Method { get; }
+    public string Method => MethodDescriptor.HostMethodName;
+
+    public SandboxApiDescriptor Api { get; }
+
+    public SandboxMethodDescriptor MethodDescriptor { get; }
 
     /// <summary>The arguments as the script passed them. An undefined argument arrives as JSON null.</summary>
     public IReadOnlyList<JsonElement> Arguments { get; }

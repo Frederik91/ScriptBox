@@ -39,16 +39,19 @@ internal sealed class WasmScriptExecutor
     private static readonly Regex UserFrameLine = new(@"script\.js:(\d+)", RegexOptions.Compiled);
 
     private readonly Module _module;
-    private readonly IReadOnlyDictionary<string, HostMethodHandler> _handlers;
+    private readonly IReadOnlyDictionary<string, HostMethod> _methods;
+    private readonly IReadOnlyList<IHostCallFilter> _filters;
     private readonly JsonSerializerOptions _jsonOptions;
 
     public WasmScriptExecutor(
         Module module,
-        IReadOnlyDictionary<string, HostMethodHandler> handlers,
+        IReadOnlyDictionary<string, HostMethod> methods,
+        IReadOnlyList<IHostCallFilter> filters,
         JsonSerializerOptions jsonOptions)
     {
         _module = module;
-        _handlers = handlers;
+        _methods = methods;
+        _filters = filters;
         _jsonOptions = jsonOptions;
     }
 
@@ -403,15 +406,16 @@ internal sealed class WasmScriptExecutor
                 return ErrorResponse("HostError", "Malformed host call: " + ex.Message);
             }
 
-            if (!_owner._handlers.TryGetValue(method, out var handler))
+            if (!_owner._methods.TryGetValue(method, out var hostMethod))
             {
                 return ErrorResponse("TypeError", $"'{method}' is not a host API method.");
             }
 
-            var context = new HostCallContext(method, arguments, _session, _owner._jsonOptions, _resolveInstance, _token);
+            var context = new HostCallContext(
+                hostMethod.Api, hostMethod.Descriptor, arguments, _session, _owner._jsonOptions, _resolveInstance, _token);
             try
             {
-                var result = handler(context).GetAwaiter().GetResult();
+                var result = Invoke(hostMethod, context).GetAwaiter().GetResult();
                 return ResultResponse(result);
             }
             catch (OperationCanceledException) when (InterruptRequested)
@@ -422,6 +426,19 @@ internal sealed class WasmScriptExecutor
             {
                 return ExceptionResponse(ex);
             }
+        }
+
+        private Task<HostCallResult> Invoke(HostMethod hostMethod, HostCallContext context)
+        {
+            var filters = _owner._filters.Count == 0 && _session.Filters.Count == 0
+                ? Array.Empty<IHostCallFilter>()
+                : _owner._filters.Concat(_session.Filters).ToArray();
+
+            Task<HostCallResult> Next(int index) => index == filters.Length
+                ? hostMethod.Handler(context)
+                : filters[index].InvokeAsync(context, () => Next(index + 1));
+
+            return Next(0);
         }
 
         private byte[] ResultResponse(HostCallResult result)

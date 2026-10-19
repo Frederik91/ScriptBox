@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Threading;
 using ScriptBox.Core.Runtime;
 using ScriptBox.Core.WasmExecution;
+using ScriptBox.Docs;
 
 namespace ScriptBox;
 
@@ -41,6 +42,9 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     private readonly Dictionary<string, object> _metadata = new();
     private readonly List<ISandboxApiScanner> _apiScanners = new();
     private readonly Dictionary<Type, string> _typeScriptOverrides = new();
+    private readonly List<IHostCallFilter> _filters = new();
+    private DocsApi? _docs;
+    private Func<SandboxApiDescriptor, bool>? _docsApiFilter;
     private string? _wasmModulePath;
     private byte[]? _wasmModuleBytes;
     private TimeSpan _executionTimeout = DefaultTimeout;
@@ -248,6 +252,34 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
         return this;
     }
 
+    /// <summary>
+    /// Runs <paramref name="filter"/> around every host call made in this box. See <see cref="IHostCallFilter"/>.
+    /// </summary>
+    public ScriptBoxBuilder UseHostCallFilter(IHostCallFilter filter)
+    {
+        _filters.Add(filter ?? throw new ArgumentNullException(nameof(filter)));
+        return this;
+    }
+
+    /// <summary>
+    /// Adds the read-only <c>docs</c> namespace: the box's own APIs under <c>/api</c>, generated from their
+    /// declarations, plus whatever <paramref name="sources"/> hold.
+    /// </summary>
+    /// <param name="sources">Further docs, such as guides and examples.</param>
+    /// <param name="includeApi">Which APIs get a folder under <c>/api</c>; every one when null.</param>
+    public ScriptBoxBuilder WithDocs(IEnumerable<IDocsSource>? sources = null, Func<SandboxApiDescriptor, bool>? includeApi = null)
+    {
+        if (_docs is not null)
+        {
+            throw new InvalidOperationException("WithDocs can only be called once.");
+        }
+
+        _docs = new DocsApi(sources ?? Array.Empty<IDocsSource>());
+        _docsApiFilter = includeApi;
+        _typeScriptOverrides[typeof(DocsPaths)] = DocsPaths.TypeScript;
+        return AddFromObject(_docs);
+    }
+
     public ScriptBoxBuilder WithApiFactory(Func<Type, object?> apiFactory)
     {
         _apiFactory = apiFactory ?? throw new ArgumentNullException(nameof(apiFactory));
@@ -307,7 +339,7 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
         AttributedSandboxApiRegistry.RegisterHandlers(apis, handlers);
 
         var jsonOptions = _jsonOptions ?? ScriptBoxJson.CreateDefaultOptions();
-        var executor = new WasmScriptExecutor(ResolveModule(), handlers.Build(), jsonOptions);
+        var executor = new WasmScriptExecutor(ResolveModule(), handlers.Build(), _filters.ToArray(), jsonOptions);
         var limits = new ExecutionLimits
         {
             Timeout = _executionTimeout,
@@ -317,7 +349,7 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
             MaxResultBytes = _maxResultBytes,
         };
 
-        return new ScriptBox(
+        var box = new ScriptBox(
             executor,
             BuildBootstrap(apis),
             apis,
@@ -327,6 +359,8 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
             jsonOptions,
             new Dictionary<Type, string>(_typeScriptOverrides),
             _metadata);
+        _docs?.Add(new ApiReferenceDocs(box, _docsApiFilter));
+        return box;
     }
 
     private static readonly HashSet<string> ReservedNames = new(StringComparer.Ordinal) { "console", "globalThis", "__scriptbox", "__host" };

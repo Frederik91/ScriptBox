@@ -41,12 +41,16 @@ internal sealed class TypeScriptDeclarationGenerator
         }
     }
 
-    public string Generate(IEnumerable<SandboxApiDescriptor> apis)
+    public string Generate(IEnumerable<SandboxApiDescriptor> apis, Func<SandboxMethodDescriptor, bool>? include = null)
     {
         var sb = new StringBuilder();
         foreach (var api in apis)
         {
-            WriteApi(sb, api);
+            var methods = include is null ? api.Methods : api.Methods.Where(include).ToList();
+            if (methods.Count > 0)
+            {
+                WriteApi(sb, api, methods);
+            }
         }
 
         while (_pending.Count > 0)
@@ -61,11 +65,11 @@ internal sealed class TypeScriptDeclarationGenerator
         return sb.ToString().Replace("\r\n", "\n").TrimEnd() + "\n";
     }
 
-    private void WriteApi(StringBuilder sb, SandboxApiDescriptor api)
+    private void WriteApi(StringBuilder sb, SandboxApiDescriptor api, IReadOnlyList<SandboxMethodDescriptor> methods)
     {
         WriteDoc(sb, "", Describe(api.ApiType), Array.Empty<string>());
         sb.Append("declare const ").Append(api.JsNamespace).AppendLine(": {");
-        foreach (var method in api.Methods)
+        foreach (var method in methods)
         {
             var parameters = method.Method.GetParameters()
                 .Where(p => p.ParameterType != typeof(HostCallContext) && p.ParameterType != typeof(CancellationToken))

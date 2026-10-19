@@ -17,6 +17,7 @@ public sealed class ScriptBox : IScriptBox
     private readonly Func<Type, object?>? _apiFactory;
     private readonly JsonSerializerOptions _jsonOptions;
     private readonly Lazy<string> _declarations;
+    private readonly IReadOnlyDictionary<Type, string> _typeOverrides;
 
     internal ScriptBox(
         WasmScriptExecutor executor,
@@ -37,6 +38,7 @@ public sealed class ScriptBox : IScriptBox
         _limits = limits;
         _jsonOptions = jsonOptions;
         Metadata = metadata;
+        _typeOverrides = typeOverrides;
         _declarations = new Lazy<string>(
             () => new TypeScriptDeclarationGenerator(jsonOptions, typeOverrides).Generate(apis),
             LazyThreadSafetyMode.ExecutionAndPublication);
@@ -56,6 +58,9 @@ public sealed class ScriptBox : IScriptBox
     }
 
     public string GetTypeScriptDeclarations() => _declarations.Value;
+
+    public string GetTypeScriptDeclarations(Func<SandboxMethodDescriptor, bool> include) =>
+        new TypeScriptDeclarationGenerator(_jsonOptions, _typeOverrides).Generate(Apis, include ?? throw new ArgumentNullException(nameof(include)));
 
     internal ScriptExecutionResult Execute(ScriptSession session, string script, CancellationToken cancellationToken)
     {
