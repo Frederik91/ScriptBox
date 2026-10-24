@@ -1,0 +1,349 @@
+{
+  "version": 1,
+  "about": "Behaviour the .NET and Node hosts share, run by ScriptBox.Tests/ConformanceTests.cs and ScriptBox.Node/test/conformance.test.ts. Each host registers the same 'conf' namespace. Where the hosts differ on purpose, a case gives per-host expectations and says why in 'difference'.",
+  "api": {
+    "namespace": "conf",
+    "description": "Methods for conformance tests.",
+    "methods": {
+      "echo": "echo(value: any): any. Returns its argument.",
+      "add": "add(a: number, b: number): number.",
+      "greet": "greet(name: string, greeting?: string = 'Hello'): string. Returns greeting + ', ' + name.",
+      "fail": "fail(message: string): never. Throws an API error named ConfError with the message.",
+      "record": "record(tag: string): void. Appends conf.record:<tag> to the host's call log.",
+      "item": "item(id: string): { id: string, name: string }. Returns { id, name: 'Item ' + id }."
+    }
+  },
+  "cases": [
+    {
+      "name": "JSON values round-trip through a host call",
+      "script": "return await conf.echo({ s: 'x', n: 1.5, i: -2, b: true, z: null, a: [1, 'two', [3]], o: { deep: { er: [] } } });",
+      "expect": {
+        "status": "completed",
+        "value": {
+          "s": "x",
+          "n": 1.5,
+          "i": -2,
+          "b": true,
+          "z": null,
+          "a": [
+            1,
+            "two",
+            [
+              3
+            ]
+          ],
+          "o": {
+            "deep": {
+              "er": []
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "positional arguments bind in order",
+      "script": "return await conf.add(2, 3);",
+      "expect": {
+        "status": "completed",
+        "value": 5
+      }
+    },
+    {
+      "name": "an omitted trailing argument takes its default",
+      "script": "return [await conf.greet('Ada'), await conf.greet('Ada', 'Hi')];",
+      "expect": {
+        "status": "completed",
+        "value": [
+          "Hello, Ada",
+          "Hi, Ada"
+        ]
+      }
+    },
+    {
+      "name": "a script with no return completes with no value",
+      "script": "const x = 1;",
+      "expect": {
+        "status": "completed",
+        "value": null
+      }
+    },
+    {
+      "name": "a returned property set to undefined is left out",
+      "script": "return { a: 1, b: undefined };",
+      "expect": {
+        "status": "completed",
+        "value": {
+          "a": 1
+        }
+      }
+    },
+    {
+      "name": "a void method resolves to nothing",
+      "script": "const r = await conf.record('v'); return r === undefined ? 'undefined' : r === null ? 'null' : typeof r;",
+      "expect": {
+        "status": "completed",
+        "value": "undefined"
+      },
+      "dotnet": {
+        "status": "completed",
+        "value": "null"
+      },
+      "difference": ".NET sends a void method's result as null, as v3 always has. Node sends no result, so the call resolves to undefined, as a JavaScript function that returns nothing would.",
+      "calls": [
+        "conf.record:v"
+      ]
+    },
+    {
+      "name": "an API error is catchable with its name and message",
+      "script": "try { await conf.fail('not today'); return 'no error'; } catch (e) { return [e.name, e.message]; }",
+      "expect": {
+        "status": "completed",
+        "value": [
+          "ConfError",
+          "not today"
+        ]
+      }
+    },
+    {
+      "name": "an uncaught API error fails the script with its name",
+      "script": "await conf.fail('not today');",
+      "expect": {
+        "status": "failed",
+        "code": "script-error",
+        "errorName": "ConfError"
+      }
+    },
+    {
+      "name": "a thrown error reports its line in the submitted source",
+      "script": "const a = 1;\nconst b = null;\nreturn b.x;",
+      "expect": {
+        "status": "failed",
+        "code": "script-error",
+        "errorName": "TypeError",
+        "line": 3
+      }
+    },
+    {
+      "name": "a syntax error reports its line",
+      "script": "const a = 1;\nconst b = ;\nreturn a;",
+      "expect": {
+        "status": "failed",
+        "code": "invalid-source",
+        "errorName": "SyntaxError",
+        "line": 2
+      }
+    },
+    {
+      "name": "calls run in the order the script makes them",
+      "script": "await conf.record('a'); await conf.record('b'); conf.record('c'); return 1;",
+      "expect": {
+        "status": "completed",
+        "value": 1
+      },
+      "calls": [
+        "conf.record:a",
+        "conf.record:b",
+        "conf.record:c"
+      ]
+    },
+    {
+      "name": "a global set by one execution is gone in the next",
+      "before": "globalThis.leaked = 1; Object.prototype.polluted = true; return 1;",
+      "script": "return [typeof leaked, ({}).polluted === undefined];",
+      "expect": {
+        "status": "completed",
+        "value": [
+          "undefined",
+          true
+        ]
+      }
+    },
+    {
+      "name": "runtime filters wrap session filters, each in the order added",
+      "filters": {
+        "global": [
+          "g1",
+          "g2"
+        ],
+        "session": [
+          "s1"
+        ]
+      },
+      "script": "await conf.record('f'); return 1;",
+      "expect": {
+        "status": "completed",
+        "value": 1
+      },
+      "calls": [
+        "conf.record:f"
+      ],
+      "filterLog": [
+        "g1>conf.record",
+        "g2>conf.record",
+        "s1>conf.record",
+        "s1<conf.record",
+        "g2<conf.record",
+        "g1<conf.record"
+      ]
+    },
+    {
+      "name": "a filter can answer in the method's place",
+      "replace": {
+        "method": "conf.item",
+        "value": {
+          "id": "r",
+          "name": "Replaced"
+        }
+      },
+      "script": "return await conf.item('a');",
+      "expect": {
+        "status": "completed",
+        "value": {
+          "id": "r",
+          "name": "Replaced"
+        }
+      },
+      "calls": []
+    },
+    {
+      "name": "a filter can refuse a call with an error the script can catch",
+      "refuse": {
+        "method": "conf.add",
+        "errorName": "ApprovalRequiredError",
+        "message": "conf.add needs approval."
+      },
+      "script": "try { await conf.add(1, 2); return 'added'; } catch (e) { return [e.name, e.message]; }",
+      "expect": {
+        "status": "completed",
+        "value": [
+          "ApprovalRequiredError",
+          "conf.add needs approval."
+        ]
+      }
+    },
+    {
+      "name": "sealed results refuse new properties and keep arrays growable",
+      "sealResults": true,
+      "script": "const i = await conf.item('a'); const list = await conf.echo([1]); list.push(2); i.name = 'changed'; try { i.extra = 1; return 'added'; } catch (e) { return [e.name, i.name, list.length]; }",
+      "expect": {
+        "status": "completed",
+        "value": [
+          "TypeError",
+          "changed",
+          2
+        ]
+      }
+    },
+    {
+      "name": "a changed result is the script's copy only",
+      "script": "const a = await conf.item('a'); a.name = 'changed'; const b = await conf.item('a'); return b.name;",
+      "expect": {
+        "status": "completed",
+        "value": "Item a"
+      }
+    },
+    {
+      "name": "the docs list a namespace folder README first, then its files by path",
+      "script": "return (await docs.ls('/api/conf')).map((e) => e.path);",
+      "expect": {
+        "status": "completed",
+        "value": [
+          "/api/conf/README.md",
+          "/api/conf/add.d.ts",
+          "/api/conf/echo.d.ts",
+          "/api/conf/fail.d.ts",
+          "/api/conf/greet.d.ts",
+          "/api/conf/index.d.ts",
+          "/api/conf/item.d.ts",
+          "/api/conf/record.d.ts"
+        ]
+      }
+    },
+    {
+      "name": "docs.read reports a missing file per path, without failing the batch",
+      "script": "const files = await docs.read(['/api/conf/README.md', '/api/conf/nope.d.ts']); return files.map((f) => [f.path, f.content === null, f.error === null]);",
+      "expect": {
+        "status": "completed",
+        "value": [
+          [
+            "/api/conf/README.md",
+            false,
+            true
+          ],
+          [
+            "/api/conf/nope.d.ts",
+            true,
+            false
+          ]
+        ]
+      }
+    },
+    {
+      "name": "docs.grep finds a method in its declaration files",
+      "script": "const hits = await docs.grep('greet\\\\(', '/api/conf'); return [...new Set(hits.map((h) => h.path))].sort();",
+      "expect": {
+        "status": "completed",
+        "value": [
+          "/api/conf/greet.d.ts",
+          "/api/conf/index.d.ts"
+        ]
+      }
+    },
+    {
+      "name": "docs paths cannot climb out of the tree",
+      "script": "const [f] = await docs.read(['/api/../../etc/passwd']); return [f.content === null, f.error !== null];",
+      "expect": {
+        "status": "completed",
+        "value": [
+          true,
+          true
+        ]
+      }
+    },
+    {
+      "name": "an unknown method fails catchably",
+      "script": "try { await __scriptbox.hostCall('conf.missing', []); return 'called'; } catch (e) { return e.name; }",
+      "expect": {
+        "status": "completed",
+        "value": "UnknownMethodError"
+      },
+      "dotnet": {
+        "status": "completed",
+        "value": "TypeError"
+      },
+      "difference": "Node gives every refusal its own error name. .NET keeps the TypeError that v3 scripts may already catch."
+    },
+    {
+      "name": "a value with no JSON form",
+      "script": "return NaN;",
+      "expect": {
+        "status": "failed",
+        "code": "invalid-result"
+      },
+      "dotnet": {
+        "status": "completed",
+        "value": null
+      },
+      "difference": "Node refuses values that JSON would silently change. .NET keeps v3's JSON.stringify behaviour, where NaN becomes null."
+    },
+    {
+      "name": "a host call returns a promise",
+      "script": "const p = conf.add(1, 2); return [typeof p.then, await p];",
+      "expect": {
+        "status": "completed",
+        "value": [
+          "function",
+          3
+        ]
+      },
+      "dotnet": {
+        "status": "completed",
+        "value": [
+          "undefined",
+          3
+        ]
+      },
+      "difference": "Node host calls are asynchronous (guest ABI 2). .NET host calls return their value directly (ABI 1); await on a plain value still works, so scripts that await every call run on both."
+    }
+  ]
+}

@@ -33,6 +33,9 @@ internal sealed class WasmScriptExecutor
 {
     public const string UserScriptName = "script.js";
 
+    /// <summary>The guest ABI this host speaks: scriptbox.wasm's sb_abi_version.</summary>
+    public const int GuestAbiVersion = 1;
+
     // The epoch deadline sits past the timeout so the clean interrupt, which
     // reports a proper error, gets the first chance to stop the script.
     private static readonly TimeSpan HardStopGrace = TimeSpan.FromSeconds(2);
@@ -153,6 +156,19 @@ internal sealed class WasmScriptExecutor
         var eval = instance.GetFunction<int, int, int, int, int, int>("sb_eval") ?? throw MissingExport("sb_eval");
         var alloc = instance.GetFunction<int, int>("sb_alloc") ?? throw MissingExport("sb_alloc");
         var free = instance.GetAction<int>("sb_free") ?? throw MissingExport("sb_free");
+        var abiVersion = instance.GetFunction<int>("sb_abi_version") ?? throw MissingExport("sb_abi_version");
+
+        // Checked before anything runs in the guest.
+        var abi = abiVersion();
+        if (abi != GuestAbiVersion)
+        {
+            return new ScriptError(
+                ScriptErrorKind.Fault,
+                "SandboxFault",
+                $"The WASM module speaks guest ABI {abi}, but this host needs ABI {GuestAbiVersion}. It was built for another version of ScriptBox.",
+                null,
+                null);
+        }
 
         if (init() != 0)
         {

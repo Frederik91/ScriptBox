@@ -380,6 +380,9 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
 
     private static readonly HashSet<string> ReservedNames = new(StringComparer.Ordinal) { "console", "globalThis", "__scriptbox", "__host" };
 
+    /// <summary>The scriptbox.js contract this host speaks: its BOOTSTRAP_VERSION.</summary>
+    internal const int BootstrapVersion = 2;
+
     private static void RequireIdentifier(string name, Type apiType)
     {
         var valid = name.Length > 0
@@ -408,7 +411,8 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
 
     private List<BootstrapScript> BuildBootstrap(IReadOnlyList<SandboxApiDescriptor> apis)
     {
-        var options = JsonSerializer.Serialize(new Dictionary<string, object> { ["sealResults"] = _sealHostResults });
+        // "bootstrap" makes scriptbox.js refuse to run if it is another version than this host was written against.
+        var options = JsonSerializer.Serialize(new Dictionary<string, object> { ["sealResults"] = _sealHostResults, ["bootstrap"] = BootstrapVersion });
         var scripts = new List<BootstrapScript>
         {
             new("scriptbox.js", $"globalThis.__scriptbox_options = {options};\n{DefaultRuntimeResources.LoadCoreBootstrap()}"),
@@ -437,7 +441,17 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
         var bytes = _wasmModuleBytes
             ?? (_wasmModulePath is not null ? File.ReadAllBytes(_wasmModulePath) : null)
             ?? DefaultRuntimeResources.LoadEmbeddedWasm().ToArray();
-        return WasmRuntime.GetModule(bytes);
+        var module = WasmRuntime.GetModule(bytes);
+
+        // The asynchronous guest (ABI 2, for the Node host) imports its memory and posts host calls.
+        // Refuse it here with a clear message rather than at the first script.
+        if (module.Imports.Any(i => i.ModuleName == "env" || (i.ModuleName == "host" && i.Name == "post")))
+        {
+            throw new InvalidOperationException(
+                "This WASM module is the asynchronous guest (ABI 2) built for the Node host. The .NET host needs scriptbox.wasm (ABI 1).");
+        }
+
+        return module;
     }
 
     #region IScriptBoxConfigurator Explicit Implementation
