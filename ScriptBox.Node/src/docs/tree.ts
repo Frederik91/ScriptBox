@@ -85,8 +85,12 @@ export function orderEntries(entries: Iterable<DocsEntry>): DocsEntry[] {
   });
 }
 
-/** Lines between yields while a docs tree is grepped, so a long grep never holds the event loop. */
+/**
+ * How long a docs tree is grepped between yields, so a long grep never holds
+ * the event loop. The line count caps the clock reads on cheap patterns.
+ */
 const linesPerSlice = 2_000;
+const sliceMs = 8;
 
 /**
  * Docs held in memory: files added by path, folders implied by them. A file's
@@ -153,6 +157,7 @@ export class DocsTree implements DocsSource {
   async grep(request: DocsGrepRequest, signal: AbortSignal): Promise<DocsMatch[]> {
     const matches: DocsMatch[] = [];
     let sinceYield = 0;
+    let sliceStart = performance.now();
     for (const entry of this.entries) {
       if (!isUnder(entry.path, request.directory)) {
         continue;
@@ -167,9 +172,10 @@ export class DocsTree implements DocsSource {
         if (request.matcher.test(line)) {
           matches.push({ path: entry.path, line: i + 1, text: line.replace(/\r$/, '').trim() });
         }
-        if (++sinceYield >= linesPerSlice) {
-          sinceYield = 0;
+        if (++sinceYield >= linesPerSlice || performance.now() - sliceStart >= sliceMs) {
           await yieldToEventLoop(undefined, { signal });
+          sinceYield = 0;
+          sliceStart = performance.now();
         }
       }
       if (matches.length >= request.maxMatches) {
