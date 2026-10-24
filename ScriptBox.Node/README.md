@@ -213,16 +213,11 @@ Known limitations:
 
 ## The .NET host
 
-The .NET host runs `scriptbox.wasm`, guest ABI 1, whose host calls return their value directly. This package runs `scriptbox-async.wasm`, guest ABI 2, built from the same C source and QuickJS commit, whose host calls return promises. Both load the same `scriptbox.js` bootstrap, version 2. Each host refuses the other's guest, and a bootstrap of another version, before a script runs.
+The .NET host, ScriptBox 4, runs the same guest, `scriptbox-async.wasm` (guest ABI 2), and the same `scriptbox.js` bootstrap, version 3. Each host refuses a guest or bootstrap of another version before a script runs.
 
-`conformance/fixtures.json` holds cases both hosts run. Where they differ on purpose, the fixture says so:
+`conformance/fixtures.json` holds cases both hosts run, and every case expects the same result from both. They cover values, defaults, `undefined` and `null`, void methods, errors and their lines, unawaited calls, unhandled rejections, the outstanding-call limit, filters, sealing and docs.
 
-- Node names an unknown-method error `UnknownMethodError`; .NET keeps v3's `TypeError`.
-- Node refuses NaN and other values JSON would change; .NET keeps `JSON.stringify`'s behaviour.
-- A void method resolves to `undefined` on Node and `null` on .NET.
-- Host calls are promises on Node and plain values on .NET. A script that awaits every call runs on both.
-
-.NET results map onto the failure codes above: an exception named `SyntaxError` is `invalid-source`; one named `PermissionDeniedError`, `InvalidArgumentsError` or `HostError` maps by name as on Node; any other is `script-error`. `Timeout` is `timed-out`, `MemoryLimit` is `resource-limit` and `Fault` is `internal`.
+The hosts differ in features, not in contract. This package adds TypeScript checking, capabilities and discovery, per-call timeouts, message and RPC byte limits, and evidence with an audit sink. A script meets those only as errors with their own names, such as `PermissionDeniedError` or `ResponseTooLargeError`. On .NET, `ScriptError.Code` uses the failure codes above.
 
 ## Building and testing
 

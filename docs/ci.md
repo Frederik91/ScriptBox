@@ -6,7 +6,7 @@ This repo ships with two GitHub Actions workflows so new contributors immediatel
 
 Location: `.github/workflows/build-wasm.yml`. It runs on pull requests to `main`, and `publish.yml` calls it before packing.
 
-- **build-wasm** rebuilds both guest artifacts with `ScriptBox.Wasm/docker-build.sh` and fails if they or `artifacts.json` differ from what is committed. It uploads them as `scriptbox-wasm`.
+- **build-wasm** rebuilds the guest with `ScriptBox.Wasm/docker-build.sh` and fails if it or `artifacts.json` differ from what is committed. It uploads them as `scriptbox-wasm`.
 - **build-and-test** builds the .NET solution and runs the ScriptBox and Semantic Kernel tests.
 - **node** checks that `ScriptBox.Node/src/generated/build-info.ts` matches the artifacts, then builds, type-checks, lints and tests the Node package. Last, it packs the tarball and runs it in a clean Node 24 container with the network off.
 
