@@ -20,6 +20,8 @@ The repository is organized as a Visual Studio solution (`ScriptBox.sln`) contai
 *   **`ScriptBox/`**: The core library. Contains the `ScriptBox` runtime, `ScriptBoxBuilder`, WASM bridge logic, and attribute-based API discovery (`[SandboxApi]`, `[SandboxMethod]`).
 *   **`ScriptBox.DependencyInjection/`**: Extension methods for integrating ScriptBox with `Microsoft.Extensions.DependencyInjection`.
 *   **`ScriptBox.SemanticKernel/`**: Integration library for Microsoft Semantic Kernel. Contains `ScriptBoxPlugin` and tools for exposing ScriptBox as an SK function.
+*   **`ScriptBox.Node/`**: The Node host, an npm package written in TypeScript. It runs `scriptbox-async.wasm` (guest ABI 2) and loads the same `scripts/sdk/scriptbox.js` bootstrap. See its README for commands.
+*   **`conformance/fixtures.json`**: Cases both hosts run (`ScriptBox.Tests/ConformanceTests.cs` and `ScriptBox.Node/test/conformance.test.ts`). A change to shared behaviour updates both.
 
 ### Testing & Examples
 *   **`ScriptBox.Tests/`**: Unit and integration tests for the core library. Uses xUnit and Moq.
@@ -40,7 +42,7 @@ Understanding the data flow is crucial for modifying the system:
 2.  **WASM Runtime**: `WasmRuntime` compiles `scriptbox.wasm` (QuickJS compiled to WASM) once per process and shares it.
 3.  **Execution**: `ScriptSession.ExecuteAsync` runs on a dedicated 16 MB-stack thread. Each execution gets a fresh WASM instance, evaluates the bootstrap scripts (`scriptbox.js`, the generated `apis.js`, then any startup scripts) and finally the user script as `script.js`, wrapped in an async function in strict mode.
 4.  **Interop**: the guest ABI is documented at the top of `ScriptBox.Wasm/scriptbox_wrapper.c`. A script calls `ns.method(...)`, which `scriptbox.js` sends through `__host.call` as JSON; the host binds the arguments to the C# parameters, invokes the method and returns `{result}` or `{error}`. There are no fixed-size buffers in either direction.
-5.  **Limits**: on timeout or cancellation the host traps the instance from `host.interrupt` (polled by QuickJS) or `host.call`, which no script can catch. A Wasmtime epoch deadline backs that up for native code that never polls. Memory is capped with Wasmtime store limits. A changed C file means rebuilding the WASM with `ScriptBox.Wasm/build.sh` (WASI SDK 28).
+5.  **Limits**: on timeout or cancellation the host traps the instance from `host.interrupt` (polled by QuickJS) or `host.call`, which no script can catch. A Wasmtime epoch deadline backs that up for native code that never polls. Memory is capped with Wasmtime store limits. A changed C file means rebuilding both artifacts with `bash ScriptBox.Wasm/docker-build.sh` and committing them with `artifacts.json`, then running `npm run build` in `ScriptBox.Node` to refresh its build-info. CI fails on stale artifacts.
 
 ## 4. Development Workflow
 

@@ -2,6 +2,8 @@
 
 ScriptBox runs untrusted JavaScript inside QuickJS compiled to WebAssembly, in-process in a .NET application. A script can reach exactly the C# APIs you register and nothing else: no file system, no network, no ambient globals. It is built for letting a language model write a short program against your application's API instead of making one tool call per step.
 
+For Node.js servers, `ScriptBox.Node` is the same sandbox as an npm package, with async host calls, TypeScript checking, filters, limits and evidence. See [its README](ScriptBox.Node/README.md). The rest of this page covers the .NET host.
+
 ## Quick start
 
 ```csharp
@@ -173,6 +175,7 @@ With `SealHostResults()`, every object a host call returns is sealed recursively
 | `ScriptBox` | Runtime, builder, API binding, host-call filters, TypeScript declarations, docs namespace |
 | `ScriptBox.DependencyInjection` | Registers `IScriptBox` with `Microsoft.Extensions.DependencyInjection` |
 | `ScriptBox.SemanticKernel` | Exposes Semantic Kernel plugins as script APIs and a `run_js` kernel function |
+| `@frederik91/scriptbox` (npm, `ScriptBox.Node/`) | The Node host. Not published yet. |
 
 ## Performance
 
@@ -180,20 +183,22 @@ On a desktop machine, building the first box (which compiles the WASM module onc
 
 ## Building the WASM module
 
-`ScriptBox.Wasm/scriptbox_wrapper.c` is the guest side; its header comment documents the ABI. After changing it:
+`ScriptBox.Wasm/scriptbox_wrapper.c` is the guest side. Its header comment documents the ABI. It builds `scriptbox.wasm` for .NET and `scriptbox-async.wasm` for Node. After changing it:
 
 ```bash
-WASI_SDK_PATH=~/wasi-sdk-28.0 bash ScriptBox.Wasm/build.sh
+bash ScriptBox.Wasm/docker-build.sh
 ```
 
-The script clones QuickJS into `ScriptBox.Wasm/quickjs` on first use. CI builds the module the same way (`.github/workflows/build-wasm.yml`).
+This needs only Docker. It builds from pinned inputs and records the digests in `ScriptBox.Wasm/artifacts.json`. CI rebuilds both artifacts and fails if they differ from the committed ones. See [ScriptBox.Wasm/README.md](ScriptBox.Wasm/README.md).
 
 ## Repository structure
 
 ```
 ScriptBox/                          Runtime
-ScriptBox.Wasm/                     QuickJS guest (C) and build script
-scripts/sdk/                        JavaScript bootstrap evaluated before every script
+ScriptBox.Wasm/                     QuickJS guest (C), both artifacts and their build
+ScriptBox.Node/                     Node host (npm package)
+scripts/sdk/                        JavaScript bootstrap evaluated before every script, shared by both hosts
+conformance/                        Cases both hosts run
 ScriptBox.DependencyInjection/      DI helpers
 ScriptBox.SemanticKernel/           Semantic Kernel integration
 ScriptBox.Tests/                    Runtime tests
