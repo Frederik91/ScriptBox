@@ -63,7 +63,7 @@ internal static class AttributedSandboxApiRegistry
                 throw;
             }
 
-            var value = await UnwrapResultAsync(returned).ConfigureAwait(false);
+            var value = await UnwrapResultAsync(returned, declaresResult: declaredType != typeof(void)).ConfigureAwait(false);
             return new HostCallResult(value, declaredType);
         };
     }
@@ -230,7 +230,9 @@ internal static class AttributedSandboxApiRegistry
         return returnType;
     }
 
-    private static async Task<object?> UnwrapResultAsync(object? result)
+    // An async Task method's task is a Task<VoidTaskResult> at runtime, so the declared type, not the task's own type,
+    // says whether there is a result.
+    private static async Task<object?> UnwrapResultAsync(object? result, bool declaresResult)
     {
         switch (result)
         {
@@ -238,7 +240,7 @@ internal static class AttributedSandboxApiRegistry
                 return null;
             case Task task:
                 await task.ConfigureAwait(false);
-                return task.GetType().IsGenericType ? GetTaskResult(task) : null;
+                return declaresResult && task.GetType().IsGenericType ? GetTaskResult(task) : null;
             case ValueTask valueTask:
                 await valueTask.AsTask().ConfigureAwait(false);
                 return null;

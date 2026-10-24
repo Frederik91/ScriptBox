@@ -43,6 +43,13 @@ public class ScriptExecutionTests
         [SandboxMethod("fail")]
         public void Fail() => throw new InvalidOperationException("the host broke");
 
+        [SandboxMethod("touch")]
+        public async Task TouchAsync(string id)
+        {
+            await Task.Yield();
+            Calls.Add("touch:" + id);
+        }
+
         [SandboxMethod("slow")]
         public async Task<int> SlowAsync(int milliseconds, CancellationToken cancellationToken)
         {
@@ -230,6 +237,16 @@ public class ScriptExecutionTests
         Assert.Equal("TypeError", sealedResult.Error!.Name);
         Assert.Equal(5, sealedResult.Error.Line);
         Assert.True(openResult.Succeeded);
+    }
+
+    [Fact]
+    public async Task An_async_method_that_returns_Task_resolves_to_undefined()
+    {
+        var result = await Execute("const value = await store.touch('a');\nreturn typeof value;");
+
+        Assert.True(result.Succeeded, result.Error?.ToString());
+        Assert.Equal("\"undefined\"", result.Json);
+        Assert.Empty(result.HostErrors);
     }
 
     [Fact]
