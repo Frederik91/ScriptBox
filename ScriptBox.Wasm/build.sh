@@ -93,6 +93,9 @@ echo "Building scriptbox-async.wasm (ABI 2)"
     "-Wl,--initial-memory=${ASYNC_INITIAL_MEMORY}" \
     -o "${SCRIPT_DIR}/scriptbox-async.wasm"
 
+# The linker marks its output executable. The artifacts are data.
+chmod 644 "${SCRIPT_DIR}/scriptbox.wasm" "${SCRIPT_DIR}/scriptbox-async.wasm"
+
 SYNC_SHA="$(sha256sum "${SCRIPT_DIR}/scriptbox.wasm" | cut -d' ' -f1)"
 ASYNC_SHA="$(sha256sum "${SCRIPT_DIR}/scriptbox-async.wasm" | cut -d' ' -f1)"
 WRAPPER_SHA="$(sha256sum "${SCRIPT_DIR}/scriptbox_wrapper.c" | cut -d' ' -f1)"
