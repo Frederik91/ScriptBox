@@ -176,9 +176,11 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     /// </summary>
     public ScriptBoxBuilder WithMemoryLimit(long bytes)
     {
-        if (bytes < 16 * 1024 * 1024)
+        // The same bounds as the Node host: the guest starts with 16 MiB, its stack and static data, and needs room to
+        // run; a 32-bit WebAssembly memory addresses at most 4 GiB.
+        if (bytes < 32L * 1024 * 1024 || bytes > 4L * 1024 * 1024 * 1024 || bytes % (64 * 1024) != 0)
         {
-            throw new ArgumentOutOfRangeException(nameof(bytes), "The QuickJS runtime needs at least 16 MB.");
+            throw new ArgumentOutOfRangeException(nameof(bytes), "The memory limit must be whole 64 KiB pages from 32 MiB to 4 GiB.");
         }
 
         _memoryLimitBytes = bytes;
@@ -380,6 +382,9 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
 
     private static readonly HashSet<string> ReservedNames = new(StringComparer.Ordinal) { "console", "globalThis", "__scriptbox", "__host" };
 
+    /// <summary>The scriptbox.js contract this host speaks: its BOOTSTRAP_VERSION.</summary>
+    internal const int BootstrapVersion = 3;
+
     private static void RequireIdentifier(string name, Type apiType)
     {
         var valid = name.Length > 0
@@ -408,7 +413,8 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
 
     private List<BootstrapScript> BuildBootstrap(IReadOnlyList<SandboxApiDescriptor> apis)
     {
-        var options = JsonSerializer.Serialize(new Dictionary<string, object> { ["sealResults"] = _sealHostResults });
+        // "bootstrap" makes scriptbox.js refuse to run if it is another version than this host was written against.
+        var options = JsonSerializer.Serialize(new Dictionary<string, object> { ["sealResults"] = _sealHostResults, ["bootstrap"] = BootstrapVersion });
         var scripts = new List<BootstrapScript>
         {
             new("scriptbox.js", $"globalThis.__scriptbox_options = {options};\n{DefaultRuntimeResources.LoadCoreBootstrap()}"),
@@ -437,7 +443,17 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
         var bytes = _wasmModuleBytes
             ?? (_wasmModulePath is not null ? File.ReadAllBytes(_wasmModulePath) : null)
             ?? DefaultRuntimeResources.LoadEmbeddedWasm().ToArray();
-        return WasmRuntime.GetModule(bytes);
+        var module = WasmRuntime.GetModule(bytes);
+
+        // ScriptBox 3's synchronous guest (ABI 1) answered host calls through host.call. Refuse it here with a clear
+        // message rather than at the first script; any other module's ABI is checked before its first script runs.
+        if (module.Imports.Any(i => i.ModuleName == "host" && i.Name == "call"))
+        {
+            throw new InvalidOperationException(
+                "This WASM module is the synchronous guest (ABI 1) of ScriptBox 3. This host runs scriptbox-async.wasm (ABI 2).");
+        }
+
+        return module;
     }
 
     #region IScriptBoxConfigurator Explicit Implementation

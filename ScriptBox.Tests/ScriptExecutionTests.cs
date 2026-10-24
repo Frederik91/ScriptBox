@@ -114,8 +114,8 @@ public class ScriptExecutionTests
     public async Task Complex_arguments_and_results_round_trip()
     {
         var result = await Execute("""
-            store.put({ id: 'a', name: 'First', tags: ['x', 'y'], nested: { enabled: true, count: 3 } });
-            const item = store.get('a');
+            await store.put({ id: 'a', name: 'First', tags: ['x', 'y'], nested: { enabled: true, count: 3 } });
+            const item = await store.get('a');
             return item.nested.count + item.tags.length;
             """);
 
@@ -128,7 +128,7 @@ public class ScriptExecutionTests
     {
         var result = await Execute("""
             const big = 'x'.repeat(300000) + 'é漢';
-            const back = store.echo(big);
+            const back = await store.echo(big);
             if (back !== big) throw new Error('mismatch');
             return back;
             """);
@@ -164,7 +164,7 @@ public class ScriptExecutionTests
     public async Task A_host_api_rejection_reaches_the_script_as_a_catchable_error()
     {
         var result = await Execute("""
-            try { store.get('missing'); } catch (e) { return e.name + ': ' + e.message; }
+            try { await store.get('missing'); } catch (e) { return e.name + ': ' + e.message; }
             """);
 
         Assert.Equal("\"NotFoundError: No item has the id 'missing'.\"", result.Json);
@@ -173,17 +173,21 @@ public class ScriptExecutionTests
     [Fact]
     public async Task An_uncaught_host_error_points_at_the_calling_line()
     {
-        var result = await Execute("const x = 1;\nstore.fail();");
+        var result = await Execute("const x = 1;\nawait store.fail();");
 
+        // Only a ScriptApiException's message reaches the script; the exception itself stays on the host.
         Assert.Equal("HostError", result.Error!.Name);
-        Assert.Equal("the host broke", result.Error.Message);
+        Assert.Equal("store.fail failed on the host.", result.Error.Message);
         Assert.Equal(2, result.Error.Line);
+        var hostError = Assert.Single(result.HostErrors);
+        Assert.Equal("store.fail", hostError.Method);
+        Assert.Equal("the host broke", hostError.Exception.Message);
     }
 
     [Theory]
-    [InlineData("store.get();", "requires the argument 'id'")]
-    [InlineData("store.echo('a', 'b');", "takes 1 argument(s) but was given 2")]
-    [InlineData("store.put({ id: 1 });", "not a valid Item")]
+    [InlineData("await store.get();", "requires the argument 'id'")]
+    [InlineData("await store.echo('a', 'b');", "takes 1 argument(s) but was given 2")]
+    [InlineData("await store.put({ id: 1 });", "not a valid Item")]
     [InlineData("store.nope();", "not a function")]
     public async Task Bad_calls_fail_with_a_message_naming_the_problem(string script, string expected)
     {
@@ -196,7 +200,7 @@ public class ScriptExecutionTests
     [Fact]
     public async Task Omitted_trailing_arguments_take_their_defaults()
     {
-        var result = await Execute("return [store.repeat('ab'), store.repeat('ab', 3)];");
+        var result = await Execute("return [await store.repeat('ab'), await store.repeat('ab', 3)];");
 
         Assert.Equal("[\"abab\",\"ababab\"]", result.Json);
     }
@@ -213,8 +217,8 @@ public class ScriptExecutionTests
     public async Task Sealed_results_reject_a_misspelt_member_but_allow_edits()
     {
         var script = """
-            store.put({ id: 'a', name: 'First', tags: [], nested: { enabled: true, count: 0 } });
-            const item = store.get('a');
+            await store.put({ id: 'a', name: 'First', tags: [], nested: { enabled: true, count: 0 } });
+            const item = await store.get('a');
             item.name = 'Renamed';
             item.tags.push('new');
             item.nested.enabeld = false;
@@ -250,10 +254,12 @@ public class ScriptExecutionTests
     public async Task The_timeout_also_cancels_a_host_call_in_progress()
     {
         var stopwatch = Stopwatch.StartNew();
-        var result = await Execute("store.slow(10000);", b => b.WithExecutionTimeout(TimeSpan.FromMilliseconds(300)));
+        var result = await Execute("await store.slow(10000);", b => b.WithExecutionTimeout(TimeSpan.FromMilliseconds(300)));
 
         Assert.Equal(ScriptErrorKind.Timeout, result.Error!.Kind);
         Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(2), $"took {stopwatch.Elapsed}");
+        // The cancelled call is part of the stop, not a host failure.
+        Assert.Empty(result.HostErrors);
     }
 
     [Theory]
@@ -290,7 +296,7 @@ public class ScriptExecutionTests
         var api = new StoreApi();
         var box = ScriptBoxBuilder.Create().AddFromObject(api).WithExecutionTimeout(TimeSpan.FromMilliseconds(200)).Build();
 
-        await box.CreateSession().ExecuteAsync("store.slow(400); store.echo('after');");
+        await box.CreateSession().ExecuteAsync("await store.slow(400); await store.echo('after');");
 
         Assert.DoesNotContain(api.Calls, c => c.StartsWith("echo", StringComparison.Ordinal));
     }
@@ -300,10 +306,10 @@ public class ScriptExecutionTests
     {
         var box = ScriptBoxBuilder.Create().AddFromObject(new LevelApi()).Build();
 
-        var byName = await box.CreateSession().RunAsync("return levels.set('High');");
-        var byNumber = await box.CreateSession().ExecuteAsync("return levels.set(999);");
+        var byName = await box.CreateSession().RunAsync("return await levels.set('High');");
+        var byNumber = await box.CreateSession().ExecuteAsync("return await levels.set(999);");
 
-        Assert.Equal(("\"High\"", "TypeError"), (byName, byNumber.Error?.Name));
+        Assert.Equal(("\"High\"", "InvalidArgumentsError"), (byName, byNumber.Error?.Name));
     }
 
     [Fact]
@@ -378,8 +384,8 @@ public class ScriptExecutionTests
         var mine = new StoreApi();
         var session = box.CreateSession(o => o.UseApi(mine));
 
-        await session.RunAsync("store.put({ id: 'a', name: 'n', tags: [], nested: { enabled: false, count: 0 } });");
-        var otherSession = await box.CreateSession().ExecuteAsync("return store.get('a');");
+        await session.RunAsync("await store.put({ id: 'a', name: 'n', tags: [], nested: { enabled: false, count: 0 } });");
+        var otherSession = await box.CreateSession().ExecuteAsync("return await store.get('a');");
 
         Assert.Equal(new[] { "put:a" }, mine.Calls);
         Assert.Equal("NotFoundError", otherSession.Error!.Name);
@@ -409,7 +415,7 @@ public class ScriptExecutionTests
         var callerThread = Environment.CurrentManagedThreadId;
         var box = ScriptBoxBuilder.Create().AddFromObject(new ThreadProbe()).Build();
 
-        var result = await box.CreateSession().ExecuteAsync("return probe.threadId();");
+        var result = await box.CreateSession().ExecuteAsync("return await probe.threadId();");
 
         Assert.NotEqual(callerThread.ToString(), result.Json);
     }

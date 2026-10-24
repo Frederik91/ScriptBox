@@ -42,13 +42,13 @@ public static class ScriptBoxPromptGenerator
         }
 
         sb.AppendLine("IMPORTANT RULES:");
-        sb.AppendLine("1. All API calls are SYNCHRONOUS. They return values directly.");
-        sb.AppendLine("2. Do NOT use await or .then().");
+        sb.AppendLine("1. Every API call returns a promise. Always `await` it.");
+        sb.AppendLine("2. Do NOT use .then(). Use await instead.");
         sb.AppendLine("3. Use the exact method names listed above.");
         sb.AppendLine("4. Do not invent methods that are not listed.");
         sb.AppendLine("5. Do NOT chain methods.");
-        sb.AppendLine("   BAD: `utils.math_add(1, 2).round()`");
-        sb.AppendLine("   GOOD: `let sum = utils.math_add(1, 2); let rounded = utils.math_round(sum);`");
+        sb.AppendLine("   BAD: `(await utils.math_add(1, 2)).round()`");
+        sb.AppendLine("   GOOD: `let sum = await utils.math_add(1, 2); let rounded = await utils.math_round(sum);`");
         sb.AppendLine("6. Do NOT reference a variable inside its own definition. Use intermediate variables.");
         sb.AppendLine("7. Write a valid JavaScript script to solve the user's task.");
         sb.AppendLine("8. ALWAYS use the `return` keyword to return the final result object at the end of the script.");

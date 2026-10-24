@@ -64,7 +64,7 @@ public class DocsApiTests
         var files = await Run("return docs.read('/api/files/read.d.ts');");
 
         var content = files[0].GetProperty("content").GetString();
-        Assert.Contains("read(path: string): string;", content);
+        Assert.Contains("read(path: string): Promise<string>;", content);
         Assert.DoesNotContain("write(", content);
     }
 
@@ -117,7 +117,7 @@ public class DocsApiTests
     [Fact]
     public void The_declarations_type_read_as_one_path_or_several()
     {
-        Assert.Contains("read(paths: string | string[]): DocsFile[];", Build().GetTypeScriptDeclarations());
+        Assert.Contains("read(paths: string | string[]): Promise<DocsFile[]>;", Build().GetTypeScriptDeclarations());
     }
 
     [Fact]
@@ -125,7 +125,7 @@ public class DocsApiTests
     {
         var box = ScriptBoxBuilder.Create().AddFromObject(new FilesApi()).WithDocs(includeApi: a => a.JsNamespace != "docs").Build();
 
-        var listing = box.CreateSession().ExecuteAsync("return docs.ls('/api').map(e => e.path);").Result;
+        var listing = box.CreateSession().ExecuteAsync("return (await docs.ls('/api')).map(e => e.path);").Result;
 
         Assert.Equal("""["/api/files"]""", listing.Json);
     }

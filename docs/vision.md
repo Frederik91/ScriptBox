@@ -17,18 +17,18 @@ Modern AI copilots constantly emit small snippets of JavaScript/TypeScript that 
 ## High-level architecture
 
 ```
-┌──────────────┐      ┌────────────────┐      ┌────────────────┐
-│ .NET Host    │      │ QuickJS + WASM │      │ User Script     │
-│ (WasmScript  │◀────▶│ (scriptbox.wasm│◀────▶│ (AI-generated   │
-│ Executor)    │host  │ + scriptbox│ API  │  TypeScript)    │
-└──────────────┘call  └────────────────┘bridge└────────────────┘
+┌────────────────────┐  host.post  ┌───────────────────────┐        ┌──────────────────┐
+│ .NET or Node host  │◀───────────▶│ QuickJS + WASM        │◀──────▶│ User script      │
+│ (WasmScriptExecutor│  sb_resume  │ (scriptbox-async.wasm)│  API   │ (AI-generated JS │
+│  or ScriptBox.Node)│             │                       │        │  or TypeScript)  │
+└────────────────────┘             └───────────────────────┘        └──────────────────┘
 ```
 
-- **ScriptBox/Core/WasmExecution** loads `scriptbox.wasm`, evaluates the bootstrap scripts, and feeds user code through `sb_eval`.
-- The WASM module exposes a minimal `__host.call(requestJson)` entry point. All host APIs are funneled through that synchronous JSON call.
-- **`scripts/sdk/scriptbox.js`** wraps `__host.call`, removes `__host` from the global scope, and exposes:
-  - `__scriptbox.hostCall(method, args)` – synchronous host RPC.
-  - `__scriptbox.createMethod("Namespace.Method")` – returns a callable that handles argument/response marshalling.
+- **ScriptBox/Core/WasmExecution** loads `scriptbox-async.wasm`, evaluates the bootstrap scripts, and starts user code through `sb_eval`. The Node host does the same in a worker thread.
+- A host call is posted: the guest's `__host.post(requestJson)` queues it and returns, and the host settles it later through `sb_resume`. Every host API returns a promise.
+- **`scripts/sdk/scriptbox.js`** wraps `__host.post`, removes `__host` from the global scope, and exposes:
+  - `__scriptbox.hostCall(method, args)` – a host call that returns a promise.
+  - `__scriptbox.createMethod("Namespace.Method")` – returns a function that makes that call.
 - **Bootstrap scripts**: `scriptbox.js`, then the namespaces generated from registered APIs, then anything added with `WithStartupScript`.
 
 ## Defining your own ScriptBox API
@@ -142,7 +142,7 @@ var scriptBox = ScriptBoxBuilder
 
 ## Takeaways
 
-- The **core deliverable** is the combination of `WasmScriptExecutor` + `scriptbox.wasm` + `__scriptbox`. Everything else is built on top of this foundation.
+- The **core deliverable** is the combination of `WasmScriptExecutor` + `scriptbox-async.wasm` + `__scriptbox`. Everything else is built on top of this foundation.
 - **Attribute-based APIs** (`[SandboxApi]` and `[SandboxMethod]`) are the recommended way to expose .NET functionality to JavaScript, with automatic bootstrap generation.
 - **Semantic Kernel integration** enables LLM agents to discover and invoke ScriptBox APIs through a unified `run_js` tool, providing significant token savings for multi-step tasks.
 - Teams can extend ScriptBox by implementing custom `ISandboxApiScanner` instances or using the low-level `HostApiBuilder` for advanced scenarios.

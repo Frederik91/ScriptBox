@@ -71,7 +71,7 @@ public class HostCallFilterTests
         var proposed = new List<string>();
         var box = ScriptBoxBuilder.Create().AddFromObject(shop).UseHostCallFilter(new ProposeEffects(proposed)).Build();
 
-        var result = await box.CreateSession().ExecuteAsync("return [shop.price('tea'), shop.buy('tea')];");
+        var result = await box.CreateSession().ExecuteAsync("return [await shop.price('tea'), await shop.buy('tea')];");
 
         Assert.True(result.Succeeded, result.Error?.Message);
         Assert.Equal("""[10,{"proposed":true}]""", result.Json);
@@ -85,7 +85,7 @@ public class HostCallFilterTests
         var box = ScriptBoxBuilder.Create().AddFromObject(new ShopApi()).UseHostCallFilter(new Refuse()).Build();
 
         var result = await box.CreateSession().ExecuteAsync("""
-            try { shop.buy('tea'); } catch (e) { return e.name + ': ' + e.message; }
+            try { await shop.buy('tea'); } catch (e) { return e.name + ': ' + e.message; }
             """);
 
         Assert.Equal("\"ApprovalRequiredError: shop.buy needs approval.\"", result.Json);
@@ -101,7 +101,7 @@ public class HostCallFilterTests
             .UseHostCallFilter(new RecordingFilter(log, "box2"))
             .Build();
 
-        await box.CreateSession(o => o.UseHostCallFilter(new RecordingFilter(log, "session"))).ExecuteAsync("shop.price('tea');");
+        await box.CreateSession(o => o.UseHostCallFilter(new RecordingFilter(log, "session"))).ExecuteAsync("await shop.price('tea');");
 
         Assert.Equal(["box1>shop.price", "box2>shop.price", "session>shop.price", "session<shop.price", "box2<shop.price", "box1<shop.price"], log);
     }
@@ -112,7 +112,7 @@ public class HostCallFilterTests
         var box = ScriptBoxBuilder.Create().AddFromObject(new ShopApi()).UseHostCallFilter(new Refuse()).Build();
 
         var result = await box.CreateSession().ExecuteAsync("""
-            try { __scriptbox.hostCall('shop.buy', ['tea']); } catch (e) { return e.name; }
+            try { await __scriptbox.hostCall('shop.buy', ['tea']); } catch (e) { return e.name; }
             """);
 
         Assert.Equal("\"ApprovalRequiredError\"", result.Json);
@@ -140,7 +140,7 @@ public class HostCallFilterTests
 
         var declarations = box.GetTypeScriptDeclarations(m => m.JsMethodName == "price");
 
-        Assert.Contains("price(item: string): number;", declarations);
+        Assert.Contains("price(item: string): Promise<number>;", declarations);
         Assert.DoesNotContain("buy(", declarations);
     }
 

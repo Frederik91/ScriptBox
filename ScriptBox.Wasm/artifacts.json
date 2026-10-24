@@ -1,0 +1,15 @@
+{
+  "quickjs": {
+    "repository": "https://github.com/bellard/quickjs.git",
+    "commit": "fcbf5ea2a63510f35f9ab2baadd59781be16a167"
+  },
+  "wasiSdk": "28.0",
+  "wrapperSha256": "2bb7d839e24ebbe95fb3adaa137423b8c0cfe12781fb4b2d354cd7bc28c9d9e9",
+  "artifacts": {
+    "scriptbox-async.wasm": {
+      "abi": 2,
+      "sha256": "a52c2b3ca778ceed0bbc5b84a72c9686e5b663c7ef253af0b9b717b46d09768b",
+      "initialMemoryBytes": 16777216
+    }
+  }
+}

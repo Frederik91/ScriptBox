@@ -17,7 +17,7 @@ public class ScriptBoxBuilderTests
 
         var session = scriptBox.CreateSession();
         await session.RunAsync(@"
-const result = calculator.add(2, 3);
+const result = await calculator.add(2, 3);
 if (result !== 5) {
     throw new Error('calculator.add returned ' + result);
 }");
@@ -33,7 +33,7 @@ if (result !== 5) {
             .Build();
 
         var session = scriptBox.CreateSession();
-        await session.RunAsync("const sum = calculator.add(4, 6); if (sum !== 10) throw new Error('unexpected sum ' + sum);");
+        await session.RunAsync("const sum = await calculator.add(4, 6); if (sum !== 10) throw new Error('unexpected sum ' + sum);");
     }
 
     [Fact]
@@ -45,7 +45,7 @@ if (result !== 5) {
             .Build();
 
         var session = scriptBox.CreateSession();
-        await session.RunAsync("const sum = instanceCalc.add(1, 4); if (sum !== 5) throw new Error('unexpected sum ' + sum);");
+        await session.RunAsync("const sum = await instanceCalc.add(1, 4); if (sum !== 5) throw new Error('unexpected sum ' + sum);");
     }
 
     [Fact]
@@ -73,7 +73,7 @@ if (result !== 5) {
         Assert.False(factoryCalled);
 
         var session = scriptBox.CreateSession();
-        await session.RunAsync("const sum = instanceCalc.add(2, 8); if (sum !== 10) throw new Error('unexpected sum ' + sum);");
+        await session.RunAsync("const sum = await instanceCalc.add(2, 8); if (sum !== 10) throw new Error('unexpected sum ' + sum);");
 
         Assert.True(factoryCalled);
     }
@@ -88,7 +88,7 @@ if (result !== 5) {
 
         var session = scriptBox.CreateSession();
         await session.RunAsync(@"
-const result = my_calc.add(10, 5);
+const result = await my_calc.add(10, 5);
 if (result !== 15) {
     throw new Error('my_calc.add returned ' + result);
 }");

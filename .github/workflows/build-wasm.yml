@@ -5,12 +5,6 @@ on:
     branches: [ main ]
   workflow_call:
 
-env:
-  WASI_SDK_VERSION: 28.0
-  WASI_SDK_NAME: wasi-sdk-28.0
-  WASI_SDK_ARCHIVE: wasi-sdk-28.0-linux.tar.gz
-  WASI_SDK_URL: https://github.com/WebAssembly/wasi-sdk/releases/download/wasi-sdk-28/wasi-sdk-28.0-x86_64-linux.tar.gz
-
 jobs:
   build-wasm:
     runs-on: ubuntu-latest
@@ -19,37 +13,24 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Cache the extracted SDK to speed up builds
-      - name: Cache WASI SDK
-        uses: actions/cache@v4
-        id: cache-wasi
-        with:
-          path: wasi-sdk
-          key: wasi-sdk-${{ env.WASI_SDK_VERSION }}-linux
+      # Rebuilds the guest from the pinned inputs in toolchain.env.
+      - name: Build WASM modules
+        run: bash ScriptBox.Wasm/docker-build.sh
 
-      - name: Download WASI SDK
-        if: steps.cache-wasi.outputs.cache-hit != 'true'
+      # The committed artifacts must be exactly what their inputs build.
+      - name: Check the committed artifacts are current
         run: |
-          mkdir -p wasi-sdk
-          curl -L "${{ env.WASI_SDK_URL }}" -o wasi-sdk.tar.gz
-          tar -xzf wasi-sdk.tar.gz --strip-components=1 -C wasi-sdk
-          rm wasi-sdk.tar.gz
-
-      - name: Set WASI_SDK_PATH
-        run: echo "WASI_SDK_PATH=$PWD/wasi-sdk" >> $GITHUB_ENV
-
-      - name: Make build script executable
-        run: chmod +x ScriptBox.Wasm/build.sh
-
-      - name: Build WASM module
-        working-directory: ScriptBox.Wasm
-        run: ./build.sh
+          git status --porcelain -- ScriptBox.Wasm
+          git diff --exit-code -- ScriptBox.Wasm
+          test -z "$(git status --porcelain -- ScriptBox.Wasm)"
 
       - name: Upload WASM artifact
         uses: actions/upload-artifact@v4
         with:
           name: scriptbox-wasm
-          path: ScriptBox.Wasm/scriptbox.wasm
+          path: |
+            ScriptBox.Wasm/scriptbox-async.wasm
+            ScriptBox.Wasm/artifacts.json
           retention-days: 30
 
   build-and-test:
@@ -83,3 +64,43 @@ jobs:
         run: |
           dotnet test ScriptBox.Tests/ScriptBox.Tests.csproj --configuration Release --no-build --verbosity normal
           dotnet test ScriptBox.SemanticKernel.Tests/ScriptBox.SemanticKernel.Tests.csproj --configuration Release --no-build --verbosity normal
+
+  node:
+    needs: build-wasm
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ScriptBox.Node
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          cache: npm
+          cache-dependency-path: ScriptBox.Node/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Check build-info.ts matches the artifacts
+        run: node scripts/build.ts --check
+
+      - name: Build
+        run: npm run build
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Test
+        run: npm test
+
+      # Packs the tarball and runs it in a clean Node 24 container with the network off.
+      - name: Package test
+        run: npm run test:package

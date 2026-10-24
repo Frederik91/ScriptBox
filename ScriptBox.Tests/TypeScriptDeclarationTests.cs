@@ -75,7 +75,7 @@ public class TypeScriptDeclarationTests
 
         Assert.Contains("/** Reads and edits shapes. */\ndeclare const shapes: {", ts);
         Assert.Contains("   * Returns one shape.\n   * @param id The shape's id.\n", ts);
-        Assert.Contains("  get(id: string): Shape;", ts);
+        Assert.Contains("  get(id: string): Promise<Shape>;", ts);
     }
 
     [Fact]
@@ -83,9 +83,9 @@ public class TypeScriptDeclarationTests
     {
         var ts = Generate();
 
-        Assert.Contains("  find(name?: string | null, limit?: number): Shape[];", ts);
-        Assert.Contains("  tryGet(id: string): Shape | null;", ts);
-        Assert.Contains("  remove(id: string): void;", ts);
+        Assert.Contains("  find(name?: string | null, limit?: number): Promise<Shape[]>;", ts);
+        Assert.Contains("  tryGet(id: string): Promise<Shape | null>;", ts);
+        Assert.Contains("  remove(id: string): Promise<void>;", ts);
     }
 
     [Fact]
@@ -114,7 +114,7 @@ public class TypeScriptDeclarationTests
     {
         var ts = Generate();
 
-        Assert.Contains("colors(): Record<string, Color>;", ts);
+        Assert.Contains("colors(): Promise<Record<string, Color>>;", ts);
         Assert.Contains("/** Red: The default. */\ntype Color = \"Red\" | \"Green\";", ts);
     }
 

@@ -1,178 +1,28 @@
-# WASM Module Development
+# ScriptBox guest
 
-This directory contains the C wrapper that bridges your C# host with a QuickJS JavaScript runtime, compiled to WebAssembly (WASM).
+The guest is QuickJS compiled to WebAssembly, with a small C bridge in `scriptbox_wrapper.c`. It builds one artifact, `scriptbox-async.wasm`, which the .NET host (`ScriptBox`) and the Node host (`ScriptBox.Node`) both run.
 
-## Files
+It speaks guest ABI 2. A host call is posted: `host.post` returns a call id, the script waits on a promise, and the host later calls `sb_resume` with the answer. Memory is imported (`env.memory`), so the host sets its maximum, and the allocator traps through `host.limit` when it is reached. The guest exports `sb_abi_version`, and each host checks it before a script runs. Both hosts load the same bootstrap, `scripts/sdk/scriptbox.js`.
 
-- **`scriptbox_wrapper.c`**: The main C bridge code that:
-  - Initializes QuickJS runtime and context
-  - Exports `eval_js(ptr, len)` entry point
-  - Imports `host_call(in_ptr, in_len, out_ptr, out_cap)` from C#
-  - Defines `globalThis.scriptbox` with JS bindings to `host_call`
-  - Only ~150 lines of C code
+ScriptBox 3's synchronous guest, `scriptbox.wasm` (ABI 1), is gone.
 
-- **`build.sh`**: macOS/Linux build script
-- **`build.bat`**: Windows build script  
-- **`BUILD.md`**: Detailed build instructions
+## Building
 
-## Quick Start
-
-### 1. Set up the WASI SDK
-
-Download from: https://github.com/WebAssembly/wasi-sdk/releases
-
-Extract and set the path:
-```bash
-export WASI_SDK_PATH="$HOME/wasi-sdk-20.0"
+```sh
+bash ScriptBox.Wasm/docker-build.sh
 ```
 
-### 2. Build the WASM module
+This needs only Docker with Linux containers. The image pins Debian, WASI SDK 28 (checked by SHA-256) and the QuickJS commit in `toolchain.env`. The compile step runs with the network off. It writes the artifact and `artifacts.json`, which records the inputs and the artifact's SHA-256.
 
-```bash
-cd ScriptBox.Wasm
-./build.sh
-```
+The build is reproducible. CI runs it and fails if the artifact or `artifacts.json` differ from what is committed. The Node package checks the artifact's digest against `artifacts.json` when it builds and again when it loads.
 
-Or on Windows:
-```cmd
-cd ScriptBox.Wasm
-build.bat
-```
+To build without Docker, run `build.sh` with `WASI_SDK_PATH` set to WASI SDK 28 and `QUICKJS_DIR` set to a QuickJS clone that holds the pinned commit. The result matches the committed digest only with the same toolchain.
 
-This produces `scriptbox.wasm` (~200-300KB).
+## Changing the guest
 
-### 3. The module is automatically copied to output
+1. Edit `scriptbox_wrapper.c`, or change a pin in `toolchain.env`.
+2. Run `docker-build.sh` and commit the artifact with `artifacts.json`.
+3. In `ScriptBox.Node`, run `npm run build` to regenerate `src/generated/build-info.ts`, and commit it.
+4. If an export, an import or the meaning of a call changes, raise the ABI version in the wrapper and in both hosts.
 
-When you rebuild the Worker project:
-```bash
-dotnet build ScriptBox/ScriptBox.csproj
-```
-
-It copies `scriptbox.wasm` to the output directory.
-
-### 4. Run the full system
-
-```bash
-dotnet run --project ScriptBox.Demo/ScriptBox.Demo.csproj
-```
-
-## Architecture
-
-```
-┌─────────────────────────────────────────┐
-│ TypeScript/JavaScript                   │
-│ (scripts/sample-script.ts)              │
-└──────────────┬──────────────────────────┘
-               │ Compiles to JS
-               ▼
-┌─────────────────────────────────────────┐
-│ Compiled JavaScript                     │
-│ (scripts/dist/sample-script.js)         │
-└──────────────┬──────────────────────────┘
-               │ Sent to Worker
-               ▼
-┌─────────────────────────────────────────┐
-│ Host (C#)                               │
-│ Writes JS code to WASM memory           │
-│ Calls eval_js(ptr, len)                 │
-└──────────────┬──────────────────────────┘
-               │ Instantiates WASM module
-               ▼
-┌─────────────────────────────────────────┐
-│ scriptbox.wasm (QuickJS + wrapper)      │
-│ - eval_js() parses & executes JS        │
-│ - JS calls scriptbox.log/add         │
-│ - Which calls host_call()               │
-└──────────────┬──────────────────────────┘
-               │ JSON RPC calls through
-               ▼
-┌─────────────────────────────────────────┐
-│ Worker (C#)                             │
-│ - HandleHostCall() dispatches to C#     │
-│ - Calls Host.Log / Host.Add via RPC     │
-└──────────────┬──────────────────────────┘
-               │ JSON RPC response
-               ▼
-┌─────────────────────────────────────────┐
-│ Host Process                            │
-│ Receives result, prints output          │
-└─────────────────────────────────────────┘
-```
-
-## The Bridge Protocol
-
-JavaScript in WASM calls `__host_call_json(jsonString)`:
-
-**Input (from JS):**
-```json
-{"method":"Log","args":["Hello from WASM"]}
-```
-
-**C# handles it in `HandleHostCall`:**
-- Parses method name
-- Calls appropriate C# API (Host.Log, Host.Add, etc.)
-- Gets result
-
-**Output (back to JS):**
-```json
-{"result":null}
-```
-
-All communication is JSON-based, so adding new APIs is as simple as:
-1. Add a new case in `HandleHostCall`
-2. Add a new method to the JS bootstrap in `scriptbox_wrapper.c`
-3. No additional C glue code needed!
-
-## Debugging
-
-### Build failures
-See `BUILD.md` Troubleshooting section.
-
-### Runtime errors
-- Check `Host` console output for error messages from `eval_js`
-- JavaScript errors are printed (if enabled in scriptbox_wrapper.c)
-- WASM memory can be inspected through the C# `Memory` object
-
-### Performance
-- The WASM module is sandboxed; only talk to the host via `host_call`
-- No filesystem access, no network directly (controlled via C# API)
-- Memory is limited to WASM linear memory (default 1GB)
-
-## Extending the API
-
-To add a new method like `scriptbox.divide(a, b)`:
-
-1. **Add C# implementation** in `HandleHostCall`:
-   ```csharp
-   case "Divide":
-       var dividend = args[0].GetDouble();
-       var divisor = args[1].GetDouble();
-       var result = _rpc.InvokeAsync<double>("Host.Divide", dividend, divisor)
-           .GetAwaiter().GetResult();
-       return $"{{\"result\":{result}}}";
-   ```
-
-2. **Add C bootstrap** in `scriptbox_wrapper.c`:
-   ```c
-   "  divide: async function(a, b) {                               \n"
-   "    const res = JSON.parse(                                    \n"
-   "      hostCall(JSON.stringify({ method: 'Divide', args: [a,b] }))\n"
-   "    );                                                          \n"
-   "    return res.result;                                         \n"
-   "  }                                                            \n"
-   ```
-
-3. **Rebuild**:
-   ```bash
-   ./build.sh
-   dotnet build ScriptBox/ScriptBox.csproj
-   ```
-
-That's it! No additional C functions or glue code needed.
-
-## References
-
-- QuickJS: https://bellard.org/quickjs/
-- QuickJS-NG (maintained fork): https://github.com/quickjs-zh/quickjs-ng
-- WebAssembly: https://webassembly.org/
-- WASI SDK: https://github.com/WebAssembly/wasi-sdk
+`build.sh` makes two checked edits to `quickjs.c`. The script describes them.

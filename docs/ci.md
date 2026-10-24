@@ -2,18 +2,15 @@
 
 This repo ships with two GitHub Actions workflows so new contributors immediately understand how their code moves from a PR to a prerelease package.
 
-### `ci.yml` – Build & Test on Every Push
+### `build-wasm.yml`: build and test every pull request
 
-Location: `.github/workflows/ci.yml`
+Location: `.github/workflows/build-wasm.yml`. It runs on pull requests to `main`, and `publish.yml` calls it before packing.
 
-- **Triggers**: every push or pull request targeting `main`.
-- **Steps**:
-  1. `actions/checkout` fetches the repo.
-  2. `actions/setup-dotnet` installs the latest .NET 9 and .NET 10 SDKs (matching Wasmtime's supported TFMs).
-  3. `dotnet restore` restores all solution dependencies.
-  4. `dotnet build --configuration Release --no-restore` builds every project.
-  5. `dotnet test --configuration Release --no-build` runs the entire test suite.
-- **Purpose**: provides fast feedback that the solution compiles and tests pass before merging. Failing builds will block PRs.
+- **build-wasm** rebuilds the guest with `ScriptBox.Wasm/docker-build.sh` and fails if it or `artifacts.json` differ from what is committed. It uploads them as `scriptbox-wasm`.
+- **build-and-test** builds the .NET solution and runs the ScriptBox and Semantic Kernel tests.
+- **node** checks that `ScriptBox.Node/src/generated/build-info.ts` matches the artifacts, then builds, type-checks, lints and tests the Node package. Last, it packs the tarball and runs it in a clean Node 24 container with the network off.
+
+Nothing in this workflow publishes the npm package.
 
 ### `publish.yml` – Publish NuGets on Release
 

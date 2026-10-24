@@ -7,7 +7,7 @@ namespace ScriptBox.Core.WasmExecution;
 
 internal static class DefaultRuntimeResources
 {
-    private const string WasmResourceName = "ScriptBox.Wasm.scriptbox.wasm";
+    private const string WasmResourceName = "ScriptBox.Wasm.scriptbox-async.wasm";
     private const string CoreBootstrapResourceName = "ScriptBox.Js.sandbox-api.js";
     private const string ToolsBootstrapResourceName = "ScriptBox.Js.bootstrap-utils.js";
 

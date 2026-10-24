@@ -33,7 +33,7 @@ public class PerApiJsonOptionsTests
     public async Task Each_api_binds_and_returns_with_its_own_serializer()
     {
         var result = await Build().CreateSession().ExecuteAsync("""
-            return [snake.echo({ display_name: 'a' }), camel.echo({ displayName: 'b' })];
+            return [await snake.echo({ display_name: 'a' }), await camel.echo({ displayName: 'b' })];
             """);
 
         Assert.Equal("""[{"display_name":"a"},{"displayName":"b"}]""", result.Json);

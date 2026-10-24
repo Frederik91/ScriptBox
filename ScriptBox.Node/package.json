@@ -1,0 +1,58 @@
+{
+  "name": "@frederik91/scriptbox",
+  "version": "0.1.0",
+  "description": "Run untrusted, AI-written JavaScript and TypeScript in Node.js against the APIs you register: QuickJS in WebAssembly, async host calls, policy filters, limits and evidence.",
+  "license": "MIT",
+  "author": "Frederik Tegnander",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Frederik91/ScriptBox.git",
+    "directory": "ScriptBox.Node"
+  },
+  "keywords": [
+    "sandbox",
+    "quickjs",
+    "wasm",
+    "typescript",
+    "llm",
+    "code-execution"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "!dist/**/*.tsbuildinfo",
+    "README.md",
+    "LICENSE",
+    "THIRD_PARTY_NOTICES.md"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node scripts/build.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p test/tsconfig.json --noEmit && tsc -p examples/tsconfig.json --noEmit && tsc -p scripts/tsconfig.json --noEmit && tsc -p bench/tsconfig.json --noEmit",
+    "lint": "eslint .",
+    "test": "node --test --test-concurrency=1 \"test/**/*.test.ts\"",
+    "test:package": "node scripts/package-test.ts",
+    "bench": "node bench/run.ts",
+    "check": "npm run build && npm run typecheck && npm run lint && npm test"
+  },
+  "dependencies": {
+    "typebox": "1.4.3",
+    "typescript": "6.0.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "24.19.2",
+    "eslint": "10.13.0",
+    "typescript-eslint": "8.72.0"
+  }
+}
