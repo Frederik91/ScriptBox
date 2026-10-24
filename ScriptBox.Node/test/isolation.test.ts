@@ -379,3 +379,37 @@ return out;`,
     });
   });
 });
+
+describe('time and randomness', () => {
+  const source = 'const a = new Date().toISOString(); for (let i = 0; i < 200000; i++) {} return [a, Date.now() - Date.parse(a), Math.random(), Math.random()];';
+
+  const start = Date.parse('2026-01-01T00:00:00Z');
+
+  async function twice(frozenGuestClock: boolean, now: () => number): Promise<[unknown, unknown]> {
+    const runtime = await createRuntime<Ctx>({ apis: [testApis([]).test], frozenGuestClock, clock: { now } });
+    try {
+      const s = runtime.createSession({ context: { tenant: 'a' }, capabilities: ['*'] });
+      return [completed(await s.execute({ language: 'javascript', source })), completed(await s.execute({ language: 'javascript', source }))];
+    } finally {
+      await runtime.dispose();
+    }
+  }
+
+  test('a frozen guest clock at the same start gives the same time and random numbers each run', async () => {
+    const [first, second] = await twice(true, () => start);
+    assert.deepEqual(second, first);
+    assert.ok(Array.isArray(first));
+    assert.equal(first[1], 0);
+  });
+
+  test('a running clock moves and the random numbers differ', async () => {
+    const [first, second] = await twice(false, () => start + performance.now());
+    assert.notDeepEqual(second, first);
+  });
+
+  test('the guest reads the injected clock', async () => {
+    const [first] = await twice(true, () => start);
+    assert.ok(Array.isArray(first));
+    assert.equal(first[0], '2026-01-01T00:00:00.000Z');
+  });
+});

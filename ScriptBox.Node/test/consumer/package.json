@@ -1,0 +1,6 @@
+{
+  "name": "scriptbox-consumer",
+  "private": true,
+  "type": "module",
+  "description": "A strict TypeScript application that uses the packed tarball, as a consumer would."
+}

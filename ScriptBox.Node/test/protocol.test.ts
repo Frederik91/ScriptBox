@@ -56,7 +56,7 @@ async function startGuest(script: string, overrides: Partial<GuestWorkerData> = 
       }
     }
   });
-  worker.on('error', (error) => errors.push(error));
+  worker.on('error', (error: unknown) => errors.push(error instanceof Error ? error : new Error(String(error))));
   const exited = new Promise<number>((resolve) => worker.once('exit', resolve));
   const next = (predicate: (m: WorkerMessage) => boolean): Promise<WorkerMessage> => {
     const found = messages.find(predicate);
@@ -128,7 +128,7 @@ describe('the guest worker under forged messages (11)', () => {
       guest.worker.postMessage({ t: 'settle', id: call.id, response });
       const end = await guest.next(isTerminal);
       assert.equal(end.t, 'error', response);
-      assert.ok(end.t === 'error' && (end.kind === 'script' || end.kind === 'protocol'));
+      assert.ok(end.kind === 'script' || end.kind === 'protocol');
       await guest.worker.terminate();
     }
   });

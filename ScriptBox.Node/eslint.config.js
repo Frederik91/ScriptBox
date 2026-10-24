@@ -5,7 +5,9 @@ import js from '@eslint/js';
 import tseslint from 'typescript-eslint';
 
 export default tseslint.config(
-  { ignores: ['dist/**', 'node_modules/**', 'bench/results/**', '**/*.js', '**/*.mjs'] },
+  // test/consumer resolves the package only where it is installed: the package
+  // test type-checks it there under its own strict configuration.
+  { ignores: ['dist/**', 'node_modules/**', 'bench/results/**', 'test/consumer/**', '**/*.js', '**/*.mjs'] },
   js.configs.recommended,
   ...tseslint.configs.strictTypeChecked,
   {
