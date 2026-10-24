@@ -1,10 +1,8 @@
 #!/bin/bash
-# Builds the two guest artifacts from scriptbox_wrapper.c and the QuickJS
-# revision pinned in toolchain.env, and records their digests in
-# artifacts.json:
-#
-#   scriptbox.wasm        ABI 1, synchronous host calls (.NET host)
-#   scriptbox-async.wasm  ABI 2, posted host calls and imported memory (Node host)
+# Builds the guest, scriptbox-async.wasm, from scriptbox_wrapper.c and the
+# QuickJS revision pinned in toolchain.env, and records its digest in
+# artifacts.json. It speaks ABI 2: posted host calls and imported memory. The
+# .NET and the Node host both run it.
 #
 # docker-build.sh runs this in the pinned container, which is the supported way
 # to produce artifacts that match the committed digests. Running it directly
@@ -79,24 +77,19 @@ COMMON_FLAGS=(
     -Wl,--strip-all
 )
 
-# The async guest imports its memory so the host can set the maximum. 16 MiB
-# covers the 8 MB stack and static data; artifacts.json records it.
+# The guest imports its memory so the host can set the maximum. 16 MiB covers
+# the 8 MB stack and static data; artifacts.json records it.
 ASYNC_INITIAL_MEMORY=16777216
-
-echo "Building scriptbox.wasm (ABI 1)"
-"${CLANG}" "${COMMON_FLAGS[@]}" -o "${SCRIPT_DIR}/scriptbox.wasm"
 
 echo "Building scriptbox-async.wasm (ABI 2)"
 "${CLANG}" "${COMMON_FLAGS[@]}" \
-    -DSB_ASYNC_HOST \
     -Wl,--import-memory \
     "-Wl,--initial-memory=${ASYNC_INITIAL_MEMORY}" \
     -o "${SCRIPT_DIR}/scriptbox-async.wasm"
 
-# The linker marks its output executable. The artifacts are data.
-chmod 644 "${SCRIPT_DIR}/scriptbox.wasm" "${SCRIPT_DIR}/scriptbox-async.wasm"
+# The linker marks its output executable. The artifact is data.
+chmod 644 "${SCRIPT_DIR}/scriptbox-async.wasm"
 
-SYNC_SHA="$(sha256sum "${SCRIPT_DIR}/scriptbox.wasm" | cut -d' ' -f1)"
 ASYNC_SHA="$(sha256sum "${SCRIPT_DIR}/scriptbox-async.wasm" | cut -d' ' -f1)"
 WRAPPER_SHA="$(sha256sum "${SCRIPT_DIR}/scriptbox_wrapper.c" | cut -d' ' -f1)"
 
@@ -109,10 +102,6 @@ cat > "${SCRIPT_DIR}/artifacts.json" <<EOF
   "wasiSdk": "${WASI_SDK_VERSION}",
   "wrapperSha256": "${WRAPPER_SHA}",
   "artifacts": {
-    "scriptbox.wasm": {
-      "abi": 1,
-      "sha256": "${SYNC_SHA}"
-    },
     "scriptbox-async.wasm": {
       "abi": 2,
       "sha256": "${ASYNC_SHA}",
@@ -122,5 +111,4 @@ cat > "${SCRIPT_DIR}/artifacts.json" <<EOF
 }
 EOF
 
-echo "scriptbox.wasm        ${SYNC_SHA}"
 echo "scriptbox-async.wasm  ${ASYNC_SHA}"

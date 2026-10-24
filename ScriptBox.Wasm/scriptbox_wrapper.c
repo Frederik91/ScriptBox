@@ -1,47 +1,31 @@
 #include "quickjs.h"
 #include <stdlib.h>
 #include <string.h>
-#ifdef SB_ASYNC_HOST
 #include <malloc.h>
-#endif
 
 // ============================================================================
 // ScriptBox guest: QuickJS behind a small host ABI with no size limits.
 //
-// This file builds two artifacts (see build.sh), each reporting its ABI
-// version from sb_abi_version():
-//
-//   scriptbox.wasm        ABI 1, synchronous. Used by the .NET host. A host
-//                         call blocks inside host.call until the host answers.
-//   scriptbox-async.wasm  ABI 2, built with SB_ASYNC_HOST. Used by the Node
-//                         host. A host call is posted and the guest returns
-//                         to the host, which settles it later through
-//                         sb_resume. Memory is imported so the host sets its
-//                         maximum, and a failed allocation traps.
+// This file builds scriptbox-async.wasm (see build.sh), which both the .NET
+// and the Node host run. sb_abi_version() reports ABI 2: a host call is posted
+// and the guest returns to the host, which settles it later through
+// sb_resume. Memory is imported so the host sets its maximum, and a failed
+// allocation traps.
 //
 // One WASM instance serves one execution. The host calls, in order:
 //   sb_init()                          create the runtime and install the bridge
 //   sb_alloc(n) + sb_eval(..., 0)      evaluate each bootstrap script
-//   sb_alloc(n) + sb_eval(..., 1)      ABI 1: evaluate the user script and report it
-//   sb_alloc(n) + sb_eval(..., 2)      ABI 2: start the user script; then
-//   sb_alloc(n) + sb_resume(...)       ABI 2: settle one posted call, as often as needed
-//   sb_finish()                        ABI 2: report a rejection nothing handled
+//   sb_alloc(n) + sb_eval(..., 2)      start the user script; then
+//   sb_alloc(n) + sb_resume(...)       settle one posted call, as often as needed
+//   sb_finish()                        report a rejection nothing handled
 //
 // Nothing crosses the boundary through a fixed buffer. Payloads going to the
-// host are passed as (ptr, len) into guest memory. In ABI 1 a host response is
-// fetched in two steps because only the host knows its length: host.call
-// returns the length, the guest allocates that much, and host.take copies it
-// in. In ABI 2 the host allocates with sb_alloc and passes the buffer to
-// sb_resume, which frees it.
+// host are passed as (ptr, len) into guest memory. The host allocates with
+// sb_alloc and passes the buffer to sb_resume, which frees it.
 // ============================================================================
 
-#ifdef SB_ASYNC_HOST
 #define SB_ABI_VERSION 2
-#else
-#define SB_ABI_VERSION 1
-#endif
 
-#ifdef SB_ASYNC_HOST
 // Admits one host call and returns its id, or 0 when the execution no longer
 // admits calls. The host traps instead of returning when a hard limit is hit.
 __attribute__((import_module("host"), import_name("post")))
@@ -52,13 +36,6 @@ __attribute__((import_module("host"), import_name("limit")))
 void host_limit(int kind);
 
 #define SB_LIMIT_MEMORY 1
-#else
-__attribute__((import_module("host"), import_name("call")))
-int host_call(const char* in_ptr, int in_len);
-
-__attribute__((import_module("host"), import_name("take")))
-void host_take(char* out_ptr, int out_len);
-#endif
 
 __attribute__((import_module("host"), import_name("log")))
 void host_log(int level, const char* ptr, int len);
@@ -78,9 +55,10 @@ void host_error(const char* name_ptr, int name_len,
 #define SB_SCRIPT_ERROR 1   // details were sent through host.error
 #define SB_NOT_INITIALIZED 2
 #define SB_OUT_OF_MEMORY 3
-#define SB_PENDING 4        // ABI 2: the script awaits a posted call
-#define SB_UNHANDLED_REJECTION 5 // ABI 2: details were sent through host.error
+#define SB_PENDING 4        // the script awaits a posted call
+#define SB_UNHANDLED_REJECTION 5 // details were sent through host.error
 #define SB_PROTOCOL_ERROR 6 // details were sent through host.error
+#define SB_SYNTAX_ERROR 7   // the user script did not compile; details were sent through host.error
 
 // QuickJS measures recursion on the shadow stack in linear memory (8 MB, set
 // in build.sh), but each JS frame also uses several times as much of the
@@ -156,38 +134,6 @@ static void report_pending_exception(JSContext* ctx) {
 
 // ---------- Bridge functions, exposed to JavaScript as __host.* ----------
 
-#ifndef SB_ASYNC_HOST
-// __host.call(payload: string): string
-static JSValue js_host_call(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
-    if (argc < 1) {
-        return JS_ThrowTypeError(ctx, "__host.call requires a JSON string");
-    }
-
-    size_t payload_len;
-    const char* payload = JS_ToCStringLen(ctx, &payload_len, argv[0]);
-    if (!payload) {
-        return JS_EXCEPTION;
-    }
-
-    int response_len = host_call(payload, (int)payload_len);
-    JS_FreeCString(ctx, payload);
-
-    if (response_len < 0) {
-        return JS_ThrowInternalError(ctx, "Host call failed");
-    }
-
-    char* response = malloc((size_t)response_len + 1);
-    if (!response) {
-        return JS_ThrowOutOfMemory(ctx);
-    }
-
-    host_take(response, response_len);
-    JSValue result = JS_NewStringLen(ctx, response, (size_t)response_len);
-    free(response);
-    return result;
-}
-#endif
-
 // __host.log(level: number, message: string): void
 static JSValue js_host_log(JSContext* ctx, JSValueConst this_val, int argc, JSValueConst* argv) {
     int level = 0;
@@ -206,7 +152,6 @@ static JSValue js_host_log(JSContext* ctx, JSValueConst this_val, int argc, JSVa
     return JS_UNDEFINED;
 }
 
-#ifdef SB_ASYNC_HOST
 // The bootstrap's hooks, installed once through __host.install. Only C holds
 // them, so a user script cannot reach or replace them.
 static JSValue g_resume = JS_UNDEFINED;
@@ -363,7 +308,6 @@ static const JSMallocFunctions sb_malloc_functions = {
     sb_js_realloc,
     sb_js_malloc_usable_size,
 };
-#endif
 
 static int install_bridge(JSContext* ctx) {
     JSValue global = JS_GetGlobalObject(ctx);
@@ -373,12 +317,8 @@ static int install_bridge(JSContext* ctx) {
         return -1;
     }
 
-#ifdef SB_ASYNC_HOST
     JS_SetPropertyStr(ctx, host, "post", JS_NewCFunction(ctx, js_host_post, "post", 1));
     JS_SetPropertyStr(ctx, host, "install", JS_NewCFunction(ctx, js_host_install, "install", 1));
-#else
-    JS_SetPropertyStr(ctx, host, "call", JS_NewCFunction(ctx, js_host_call, "call", 1));
-#endif
     JS_SetPropertyStr(ctx, host, "log", JS_NewCFunction(ctx, js_host_log, "log", 2));
     JS_SetPropertyStr(ctx, global, "__host", host);
     JS_FreeValue(ctx, global);
@@ -401,11 +341,7 @@ int sb_init(void) {
         return SB_OK;
     }
 
-#ifdef SB_ASYNC_HOST
     g_rt = JS_NewRuntime2(&sb_malloc_functions, NULL);
-#else
-    g_rt = JS_NewRuntime();
-#endif
     if (!g_rt) {
         report_c_error("InternalError", "Failed to create the JavaScript runtime");
         return SB_OUT_OF_MEMORY;
@@ -413,9 +349,7 @@ int sb_init(void) {
 
     JS_SetMaxStackSize(g_rt, SB_JS_STACK_SIZE);
     JS_SetInterruptHandler(g_rt, interrupt_handler, NULL);
-#ifdef SB_ASYNC_HOST
     JS_SetHostPromiseRejectionTracker(g_rt, track_rejection, NULL);
-#endif
 
     g_ctx = JS_NewContext(g_rt);
     if (!g_ctx) {
@@ -449,34 +383,6 @@ static int drain_jobs(void) {
     }
 }
 
-// undefined, functions and symbols have no JSON form; they are reported as an
-// empty result, which the host reads as "no value".
-static int report_value(JSValueConst value) {
-    JSValue json = JS_JSONStringify(g_ctx, value, JS_UNDEFINED, JS_UNDEFINED);
-    if (JS_IsException(json)) {
-        report_pending_exception(g_ctx);
-        return SB_SCRIPT_ERROR;
-    }
-
-    if (JS_IsUndefined(json)) {
-        host_result("", 0);
-        return SB_OK;
-    }
-
-    size_t len;
-    const char* str = JS_ToCStringLen(g_ctx, &len, json);
-    JS_FreeValue(g_ctx, json);
-    if (!str) {
-        report_pending_exception(g_ctx);
-        return SB_SCRIPT_ERROR;
-    }
-
-    host_result(str, (int)len);
-    JS_FreeCString(g_ctx, str);
-    return SB_OK;
-}
-
-#ifdef SB_ASYNC_HOST
 // Encodes a settled result with the bootstrap's encoder, which rejects values
 // that have no JSON form instead of dropping or coercing them.
 static int report_encoded_value(JSValueConst value) {
@@ -528,17 +434,17 @@ static int check_main(void) {
             return report_encoded_value(g_main);
     }
 }
-#endif
 
 // Evaluates a script the host wrote into a buffer from sb_alloc, and frees
 // that buffer.
 //
-// With mode = 0 the value is discarded (bootstrap scripts). With mode = 1
-// (ABI 1) the value is the execution's outcome: a promise is settled by
-// running the job queue, then a fulfilled value goes to host.result and a
-// rejection or a thrown error goes to host.error. With mode = 2 (ABI 2) the
-// script is started: once the job queue is empty it returns SB_PENDING while
-// the script awaits a posted call, or reports the outcome as mode 1 does.
+// With mode = 0 the value is discarded (bootstrap scripts). With mode = 2 the
+// user script is started: once the job queue is empty it returns SB_PENDING
+// while the script awaits a posted call, or reports the outcome: a fulfilled
+// value to host.result, a rejection or a thrown error to host.error. The host
+// wraps the user script in an async function, so evaluating it fails only when
+// the source does not compile, which returns SB_SYNTAX_ERROR. Other modes are
+// refused.
 __attribute__((export_name("sb_eval")))
 int sb_eval(char* code, int code_len, const char* name, int name_len, int mode) {
     if (!g_ctx) {
@@ -546,19 +452,11 @@ int sb_eval(char* code, int code_len, const char* name, int name_len, int mode) 
         return SB_NOT_INITIALIZED;
     }
 
-#ifdef SB_ASYNC_HOST
-    if (mode == 1 || (mode == 2 && (!g_installed || g_main_started))) {
+    if ((mode != 0 && mode != 2) || (mode == 2 && (!g_installed || g_main_started))) {
         free(code);
         report_c_error("InternalError", "This guest runs scripts with sb_eval mode 2 once, after the bootstrap installed the bridge.");
         return SB_PROTOCOL_ERROR;
     }
-#else
-    if (mode == 2) {
-        free(code);
-        report_c_error("InternalError", "This guest speaks ABI 1 and cannot start a script with sb_eval mode 2.");
-        return SB_PROTOCOL_ERROR;
-    }
-#endif
 
     char filename[128];
     int copy_len = name_len < (int)sizeof(filename) - 1 ? name_len : (int)sizeof(filename) - 1;
@@ -579,10 +477,9 @@ int sb_eval(char* code, int code_len, const char* name, int name_len, int mode) 
 
     if (JS_IsException(value)) {
         report_pending_exception(g_ctx);
-        return SB_SCRIPT_ERROR;
+        return mode == 2 ? SB_SYNTAX_ERROR : SB_SCRIPT_ERROR;
     }
 
-#ifdef SB_ASYNC_HOST
     if (mode == 2) {
         g_main = value;
         g_main_started = 1;
@@ -591,51 +488,11 @@ int sb_eval(char* code, int code_len, const char* name, int name_len, int mode) 
         }
         return check_main();
     }
-#endif
-
-    if (drain_jobs() != 0) {
-        JS_FreeValue(g_ctx, value);
-        return SB_SCRIPT_ERROR;
-    }
-
-    if (!mode) {
-        JS_FreeValue(g_ctx, value);
-        return SB_OK;
-    }
-
-    int status;
-    switch ((int)JS_PromiseState(g_ctx, value)) {
-        case -1:
-            status = report_value(value);
-            break;
-        case JS_PROMISE_FULFILLED: {
-            JSValue settled = JS_PromiseResult(g_ctx, value);
-            status = report_value(settled);
-            JS_FreeValue(g_ctx, settled);
-            break;
-        }
-        case JS_PROMISE_REJECTED: {
-            JSValue reason = JS_PromiseResult(g_ctx, value);
-            report_exception(g_ctx, reason);
-            JS_FreeValue(g_ctx, reason);
-            status = SB_SCRIPT_ERROR;
-            break;
-        }
-        default:
-            // Host calls are synchronous, so once the job queue is empty
-            // nothing is left that could settle this promise.
-            report_c_error("Error",
-                "The script awaited a promise that never settled. Host API calls return their values directly; "
-                "a promise you create yourself must be resolved by your own code.");
-            status = SB_SCRIPT_ERROR;
-            break;
-    }
 
     JS_FreeValue(g_ctx, value);
-    return status;
+    return drain_jobs() != 0 ? SB_SCRIPT_ERROR : SB_OK;
 }
 
-#ifdef SB_ASYNC_HOST
 // Settles one posted call with the host's response, written into a buffer from
 // sb_alloc, and frees that buffer. Runs the jobs the response unblocks, then
 // returns as sb_eval mode 2 does. Once the outcome has been reported, later
@@ -695,4 +552,3 @@ int sb_finish(void) {
 
     return SB_OK;
 }
-#endif

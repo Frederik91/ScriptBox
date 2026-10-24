@@ -1,6 +1,6 @@
 // Acceptance 28: the fixtures in conformance/fixtures.json, which the .NET
 // host runs too (ScriptBox.Tests/ConformanceTests.cs). Each case names what
-// both hosts must do, or says per host where they differ on purpose.
+// both hosts must do; there are no per-host expectations.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
@@ -27,7 +27,6 @@ interface Case {
   readonly script: string;
   readonly before?: string;
   readonly expect: Expectation;
-  readonly node?: Expectation;
   readonly calls?: readonly string[];
   readonly filters?: { readonly global: readonly string[]; readonly session: readonly string[] };
   readonly filterLog?: readonly string[];
@@ -91,6 +90,20 @@ function confApi(calls: string[]) {
           return { id, name: `Item ${id}` };
         },
       }),
+      rename: kit.method({
+        summary: 'Renames an item.',
+        effect: 'draft-write',
+        params: { change: Type.Object({ id: Type.String(), name: Type.String() }) },
+        result: Type.Object({ id: Type.String(), name: Type.String() }),
+        handler: ({ change }) => change,
+      }),
+      crash: kit.method({
+        summary: 'Fails on the host with an internal error.',
+        effect: 'read',
+        handler: () => {
+          throw new Error('database password is hunter2');
+        },
+      }),
     },
   });
 }
@@ -137,7 +150,7 @@ describe('conformance fixtures shared with .NET (28)', () => {
           assert.equal((await session.execute({ language: 'javascript', source: fixture.before })).status, 'completed');
         }
         const actual = normalize(await session.execute({ language: 'javascript', source: fixture.script }));
-        const expected = fixture.node ?? fixture.expect;
+        const expected = fixture.expect;
         const compared = Object.fromEntries(Object.keys(expected).map((key) => [key, Reflect.get(actual, key)]));
         assert.deepEqual(compared, expected);
         if (fixture.calls !== undefined) {

@@ -4,7 +4,7 @@ import type { WasmModule } from './wasm.ts';
 /** The guest ABI this host speaks: scriptbox-async.wasm's sb_abi_version. */
 export const guestAbiVersion = 2;
 /** The bootstrap contract this host speaks: scriptbox.js's BOOTSTRAP_VERSION. */
-export const bootstrapVersion = 2;
+export const bootstrapVersion = 3;
 /** The parent-to-worker message protocol, checked when the worker starts. */
 export const workerProtocolVersion = 1;
 

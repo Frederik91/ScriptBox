@@ -10,11 +10,11 @@ export const buildInfo = Object.freeze({
   artifact: {
     file: 'scriptbox-async.wasm',
     abi: 2,
-    sha256: '966a476a0bf92568fe60560cb6a3ca2f6486769d5ca7ce69776581db5734d4b5',
+    sha256: 'a52c2b3ca778ceed0bbc5b84a72c9686e5b663c7ef253af0b9b717b46d09768b',
     initialMemoryBytes: 16777216
   },
   bootstrap: {
     file: 'scriptbox.js',
-    sha256: 'eed947487b470a27cd137507885544a50ebe2c92e09ec1f75a2a4289f642e747'
+    sha256: 'a0b0620fd40562f9a3a4928440d15ad4022fc862c54102ddd38851ad01991a65'
   }
 } as const);

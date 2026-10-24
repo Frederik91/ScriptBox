@@ -92,7 +92,8 @@ internal sealed class TypeScriptDeclarationGenerator
             var signature = string.Join(", ", parameters.Select((p, i) =>
                 $"{p.Name}{(optional[i] ? "?" : "")}: {Reference(p.ParameterType, IsNullable(p))}"));
             var returnType = AttributedSandboxApiRegistry.GetDeclaredResultType(method.Method.ReturnType);
-            var returns = returnType == typeof(void) ? "void" : Reference(returnType, IsNullableReturn(method.Method));
+            // Every host call returns a promise the host settles later.
+            var returns = "Promise<" + (returnType == typeof(void) ? "void" : Reference(returnType, IsNullableReturn(method.Method))) + ">";
 
             sb.Append("  ").Append(method.JsMethodName).Append('(').Append(signature).Append("): ").Append(returns).AppendLine(";");
         }

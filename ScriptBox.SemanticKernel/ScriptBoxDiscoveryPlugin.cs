@@ -41,7 +41,7 @@ public sealed class ScriptBoxDiscoveryPlugin
             }
 
             sb.AppendLine("IMPORTANT GENERATION RULES:");
-            sb.AppendLine("1. All APIs are SYNCHRONOUS. Do NOT use 'await'.");
+            sb.AppendLine("1. Every API call returns a promise. Always use 'await'.");
             sb.AppendLine("2. MUST use 'return' keyword to output the result. (e.g. `return result;`).");
             sb.AppendLine("3. Do NOT output bare object literals at the end.");
             sb.AppendLine("4. Use the exact namespace and function names listed above.");

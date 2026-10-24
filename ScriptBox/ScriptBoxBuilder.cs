@@ -176,9 +176,11 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     /// </summary>
     public ScriptBoxBuilder WithMemoryLimit(long bytes)
     {
-        if (bytes < 16 * 1024 * 1024)
+        // The same bounds as the Node host: the guest starts with 16 MiB, its stack and static data, and needs room to
+        // run; a 32-bit WebAssembly memory addresses at most 4 GiB.
+        if (bytes < 32L * 1024 * 1024 || bytes > 4L * 1024 * 1024 * 1024 || bytes % (64 * 1024) != 0)
         {
-            throw new ArgumentOutOfRangeException(nameof(bytes), "The QuickJS runtime needs at least 16 MB.");
+            throw new ArgumentOutOfRangeException(nameof(bytes), "The memory limit must be whole 64 KiB pages from 32 MiB to 4 GiB.");
         }
 
         _memoryLimitBytes = bytes;
@@ -381,7 +383,7 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     private static readonly HashSet<string> ReservedNames = new(StringComparer.Ordinal) { "console", "globalThis", "__scriptbox", "__host" };
 
     /// <summary>The scriptbox.js contract this host speaks: its BOOTSTRAP_VERSION.</summary>
-    internal const int BootstrapVersion = 2;
+    internal const int BootstrapVersion = 3;
 
     private static void RequireIdentifier(string name, Type apiType)
     {
@@ -443,12 +445,12 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
             ?? DefaultRuntimeResources.LoadEmbeddedWasm().ToArray();
         var module = WasmRuntime.GetModule(bytes);
 
-        // The asynchronous guest (ABI 2, for the Node host) imports its memory and posts host calls.
-        // Refuse it here with a clear message rather than at the first script.
-        if (module.Imports.Any(i => i.ModuleName == "env" || (i.ModuleName == "host" && i.Name == "post")))
+        // ScriptBox 3's synchronous guest (ABI 1) answered host calls through host.call. Refuse it here with a clear
+        // message rather than at the first script; any other module's ABI is checked before its first script runs.
+        if (module.Imports.Any(i => i.ModuleName == "host" && i.Name == "call"))
         {
             throw new InvalidOperationException(
-                "This WASM module is the asynchronous guest (ABI 2) built for the Node host. The .NET host needs scriptbox.wasm (ABI 1).");
+                "This WASM module is the synchronous guest (ABI 1) of ScriptBox 3. This host runs scriptbox-async.wasm (ABI 2).");
         }
 
         return module;

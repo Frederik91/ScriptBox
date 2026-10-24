@@ -9,7 +9,7 @@ namespace ScriptBox.Tests;
 /// <summary>
 /// Runs conformance/fixtures.json, which the Node host runs too
 /// (ScriptBox.Node/test/conformance.test.ts). A case states what both hosts
-/// do, or gives a "dotnet" expectation where this host differs on purpose.
+/// do; there are no per-host expectations.
 /// </summary>
 public class ConformanceTests
 {
@@ -46,6 +46,14 @@ public class ConformanceTests
             Calls.Add($"conf.item:{id}");
             return new Item(id, $"Item {id}");
         }
+
+        [SandboxMethod("rename")]
+        [Description("Renames an item.")]
+        public Item Rename(Item change) => change;
+
+        [SandboxMethod("crash")]
+        [Description("Fails on the host with an internal error.")]
+        public void Crash() => throw new InvalidOperationException("database password is hunter2");
     }
 
     public sealed record Item(string Id, string Name);
@@ -138,7 +146,7 @@ public class ConformanceTests
         }
 
         var result = await session.ExecuteAsync(fixture["script"]!.GetValue<string>());
-        var expected = (fixture["dotnet"] ?? fixture["expect"])!.AsObject();
+        var expected = fixture["expect"]!.AsObject();
         var actual = Normalize(result);
         foreach (var (key, value) in expected)
         {
@@ -171,8 +179,7 @@ public class ConformanceTests
         {
             ScriptErrorKind.Timeout => new JsonObject { ["status"] = "timed-out" },
             ScriptErrorKind.MemoryLimit => new JsonObject { ["status"] = "resource-limit" },
-            ScriptErrorKind.Fault => new JsonObject { ["status"] = "failed", ["code"] = "internal" },
-            _ => new JsonObject { ["status"] = "failed", ["code"] = FailureCode(error.Name) },
+            _ => new JsonObject { ["status"] = "failed", ["code"] = error.Code },
         };
         normalized["errorName"] = error.Name;
         if (error.Line is int line)
@@ -182,16 +189,6 @@ public class ConformanceTests
 
         return normalized;
     }
-
-    /// <summary>The Node host's failure codes, read from the error name as that host does.</summary>
-    private static string FailureCode(string errorName) => errorName switch
-    {
-        "SyntaxError" => "invalid-source",
-        "PermissionDeniedError" or "UnknownMethodError" => "denied",
-        "InvalidArgumentsError" => "invalid-arguments",
-        "HostError" or "HostTimeoutError" or "ResponseTooLargeError" => "host-failure",
-        _ => "script-error",
-    };
 
     private static IReadOnlyList<JsonObject> LoadCases()
     {

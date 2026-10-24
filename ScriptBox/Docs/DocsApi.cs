@@ -175,7 +175,7 @@ public sealed class DocsApi
     {
         if (string.IsNullOrEmpty(pattern))
         {
-            throw new ScriptApiException("docs.grep needs a pattern.", "TypeError");
+            throw new ScriptApiException("docs.grep needs a pattern.", "InvalidArgumentsError");
         }
 
         const RegexOptions options = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;

@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "about": "Behaviour the .NET and Node hosts share, run by ScriptBox.Tests/ConformanceTests.cs and ScriptBox.Node/test/conformance.test.ts. Each host registers the same 'conf' namespace. Where the hosts differ on purpose, a case gives per-host expectations and says why in 'difference'.",
+  "about": "Behaviour the .NET and Node hosts share, run by ScriptBox.Tests/ConformanceTests.cs and ScriptBox.Node/test/conformance.test.ts. Each host registers the same 'conf' namespace. Both hosts must meet every expectation; there are no per-host cases.",
   "api": {
     "namespace": "conf",
     "description": "Methods for conformance tests.",
@@ -10,7 +10,9 @@
       "greet": "greet(name: string, greeting?: string = 'Hello'): string. Returns greeting + ', ' + name.",
       "fail": "fail(message: string): never. Throws an API error named ConfError with the message.",
       "record": "record(tag: string): void. Appends conf.record:<tag> to the host's call log.",
-      "item": "item(id: string): { id: string, name: string }. Returns { id, name: 'Item ' + id }."
+      "item": "item(id: string): { id: string, name: string }. Returns { id, name: 'Item ' + id }.",
+      "rename": "rename(change: { id: string, name: string }): { id: string, name: string }. Returns the change.",
+      "crash": "crash(): void. Fails on the host with an internal error whose message must not reach the script."
     }
   },
   "cases": [
@@ -84,11 +86,6 @@
         "status": "completed",
         "value": "undefined"
       },
-      "dotnet": {
-        "status": "completed",
-        "value": "null"
-      },
-      "difference": ".NET sends a void method's result as null, as v3 always has. Node sends no result, so the call resolves to undefined, as a JavaScript function that returns nothing would.",
       "calls": [
         "conf.record:v"
       ]
@@ -250,12 +247,14 @@
         "value": [
           "/api/conf/README.md",
           "/api/conf/add.d.ts",
+          "/api/conf/crash.d.ts",
           "/api/conf/echo.d.ts",
           "/api/conf/fail.d.ts",
           "/api/conf/greet.d.ts",
           "/api/conf/index.d.ts",
           "/api/conf/item.d.ts",
-          "/api/conf/record.d.ts"
+          "/api/conf/record.d.ts",
+          "/api/conf/rename.d.ts"
         ]
       }
     },
@@ -306,12 +305,7 @@
       "expect": {
         "status": "completed",
         "value": "UnknownMethodError"
-      },
-      "dotnet": {
-        "status": "completed",
-        "value": "TypeError"
-      },
-      "difference": "Node gives every refusal its own error name. .NET keeps the TypeError that v3 scripts may already catch."
+      }
     },
     {
       "name": "a value with no JSON form",
@@ -319,12 +313,7 @@
       "expect": {
         "status": "failed",
         "code": "invalid-result"
-      },
-      "dotnet": {
-        "status": "completed",
-        "value": null
-      },
-      "difference": "Node refuses values that JSON would silently change. .NET keeps v3's JSON.stringify behaviour, where NaN becomes null."
+      }
     },
     {
       "name": "a host call returns a promise",
@@ -335,15 +324,134 @@
           "function",
           3
         ]
+      }
+    },
+    {
+      "name": "a call the script did not await still runs before the outcome",
+      "script": "conf.record('late'); return 1;",
+      "expect": {
+        "status": "completed",
+        "value": 1
       },
-      "dotnet": {
+      "calls": [
+        "conf.record:late"
+      ]
+    },
+    {
+      "name": "a call that fails and that nothing handles fails the execution",
+      "script": "conf.fail('lost'); return 1;",
+      "expect": {
+        "status": "failed",
+        "code": "unhandled-rejection",
+        "errorName": "ConfError"
+      }
+    },
+    {
+      "name": "awaiting a promise nothing can settle fails the execution",
+      "script": "await new Promise(() => {}); return 1;",
+      "expect": {
+        "status": "failed",
+        "code": "never-settled"
+      }
+    },
+    {
+      "name": "a failed host call points at the line that made it",
+      "script": "const a = 1;\nawait conf.fail('here');",
+      "expect": {
+        "status": "failed",
+        "code": "script-error",
+        "errorName": "ConfError",
+        "line": 2
+      }
+    },
+    {
+      "name": "an internal host failure reaches the script without its message",
+      "script": "try { await conf.crash(); return \"called\"; } catch (e) { return [e.name, e.message]; }",
+      "expect": {
         "status": "completed",
         "value": [
-          "undefined",
-          3
+          "HostError",
+          "conf.crash failed on the host."
         ]
+      }
+    },
+    {
+      "name": "an argument with a property its type does not declare is refused",
+      "script": "try { await conf.rename({ id: 'a', name: 'b', extra: 1 }); return 'called'; } catch (e) { return e.name; }",
+      "expect": {
+        "status": "completed",
+        "value": "InvalidArgumentsError"
+      }
+    },
+    {
+      "name": "null is a value, not an omitted argument",
+      "script": "try { return await conf.greet('Ann', null); } catch (e) { return e.name; }",
+      "expect": {
+        "status": "completed",
+        "value": "InvalidArgumentsError"
+      }
+    },
+    {
+      "name": "calls beyond the outstanding limit are refused before they start",
+      "script": "const ps = []; for (let i = 0; i < 20; i++) ps.push(conf.add(i, 0).then(() => 'ok', (e) => e.name)); const r = await Promise.all(ps); return [r.filter((x) => x === 'ok').length, r.filter((x) => x === 'QueueFullError').length];",
+      "expect": {
+        "status": "completed",
+        "value": [
+          16,
+          4
+        ]
+      }
+    },
+    {
+      "name": "calls a failed script made in its last step never start",
+      "script": "conf.record('x'); throw new Error('stop');",
+      "expect": {
+        "status": "failed",
+        "code": "script-error",
+        "errorName": "Error"
       },
-      "difference": "Node host calls are asynchronous (guest ABI 2). .NET host calls return their value directly (ABI 1); await on a plain value still works, so scripts that await every call run on both."
+      "calls": []
+    },
+    {
+      "name": "an omitted argument before a given one is refused when it has no default",
+      "script": "try { await conf.greet(undefined, 'Hi'); return 'called'; } catch (e) { return e.name; }",
+      "expect": {
+        "status": "completed",
+        "value": "InvalidArgumentsError"
+      }
+    },
+    {
+      "name": "a filter that gives a void method a value fails the call",
+      "script": "try { await conf.record('x'); return 'called'; } catch (e) { return [e.name, e.message]; }",
+      "replace": {
+        "method": "conf.record",
+        "value": 5
+      },
+      "expect": {
+        "status": "completed",
+        "value": [
+          "HostError",
+          "conf.record returned a value but declares no result."
+        ]
+      }
+    },
+    {
+      "name": "a call made after the script returned is revoked",
+      "script": "globalThis.r = conf.add(1, 2).then(() => conf.add(3, 4)); return 1;",
+      "expect": {
+        "status": "failed",
+        "code": "unhandled-rejection",
+        "errorName": "RevokedError"
+      }
+    },
+    {
+      "name": "a runtime SyntaxError is a script error, not invalid source",
+      "script": "JSON.parse('{');",
+      "expect": {
+        "status": "failed",
+        "code": "script-error",
+        "errorName": "SyntaxError"
+      }
     }
   ]
 }

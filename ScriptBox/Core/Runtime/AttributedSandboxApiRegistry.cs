@@ -92,10 +92,9 @@ internal static class AttributedSandboxApiRegistry
                 continue;
             }
 
-            var supplied = argIndex < ctx.Arguments.Count ? ctx.Arguments[argIndex] : (JsonElement?)null;
-            argIndex++;
-
-            if (supplied is null || supplied.Value.ValueKind == JsonValueKind.Null)
+            // An omitted argument takes the parameter's default. null is a value, not an omission.
+            var position = argIndex++;
+            if (position >= ctx.Arguments.Count || ctx.OmittedArguments.Contains(position))
             {
                 if (parameter.HasDefaultValue)
                 {
@@ -108,21 +107,31 @@ internal static class AttributedSandboxApiRegistry
                 else
                 {
                     throw new ScriptApiException(
-                        $"{descriptor.HostMethodName} requires the argument '{parameter.Name}'.", "TypeError");
+                        $"{descriptor.HostMethodName} requires the argument '{parameter.Name}'.", InvalidArgumentsError);
                 }
 
                 continue;
             }
 
+            var supplied = ctx.Arguments[position];
+            if (supplied.ValueKind == JsonValueKind.Null)
+            {
+                values[i] = nullability[i]
+                    ? null
+                    : throw new ScriptApiException(
+                        $"{descriptor.HostMethodName}: the argument '{parameter.Name}' cannot be null.", InvalidArgumentsError);
+                continue;
+            }
+
             try
             {
-                values[i] = supplied.Value.Deserialize(parameter.ParameterType, ctx.JsonOptions);
+                values[i] = supplied.Deserialize(parameter.ParameterType, ClosedObjects(ctx.JsonOptions));
             }
             catch (JsonException ex)
             {
                 throw new ScriptApiException(
                     $"{descriptor.HostMethodName}: the argument '{parameter.Name}' is not a valid {parameter.ParameterType.Name}. {ex.Message}",
-                    "TypeError");
+                    InvalidArgumentsError);
             }
         }
 
@@ -130,10 +139,26 @@ internal static class AttributedSandboxApiRegistry
         {
             throw new ScriptApiException(
                 $"{descriptor.HostMethodName} takes {argIndex} argument(s) but was given {ctx.Arguments.Count}.",
-                "TypeError");
+                InvalidArgumentsError);
         }
 
         return values;
+    }
+
+    private const string InvalidArgumentsError = "InvalidArgumentsError";
+
+    private static readonly System.Runtime.CompilerServices.ConditionalWeakTable<JsonSerializerOptions, JsonSerializerOptions> ClosedOptions = new();
+
+    // Arguments are closed objects: a property the parameter's type does not declare is refused rather than dropped,
+    // so a misspelt field fails at the call instead of silently doing nothing.
+    private static JsonSerializerOptions ClosedObjects(JsonSerializerOptions options)
+    {
+        return options.UnmappedMemberHandling == System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow
+            ? options
+            : ClosedOptions.GetValue(options, o => new JsonSerializerOptions(o)
+            {
+                UnmappedMemberHandling = System.Text.Json.Serialization.JsonUnmappedMemberHandling.Disallow,
+            });
     }
 
     private static bool IsNullable(ParameterInfo parameter)
@@ -147,9 +172,44 @@ internal static class AttributedSandboxApiRegistry
 #if NET6_0_OR_GREATER
         return new NullabilityInfoContext().Create(parameter).WriteState != NullabilityState.NotNull;
 #else
-        return true;
+        // The attributes the compiler emits, read the way NullabilityInfoContext reads them: 1 is not null, 2 is
+        // nullable, 0 or no attribute is oblivious and accepts null.
+        var flag = NullableFlag(parameter.GetCustomAttributesData(), "System.Runtime.CompilerServices.NullableAttribute");
+        for (var member = (MemberInfo?)parameter.Member; flag is null && member is not null; member = member.DeclaringType)
+        {
+            flag = NullableFlag(member.GetCustomAttributesData(), "System.Runtime.CompilerServices.NullableContextAttribute");
+        }
+
+        return flag != 1;
 #endif
     }
+
+#if !NET6_0_OR_GREATER
+    private static byte? NullableFlag(IList<CustomAttributeData> attributes, string attributeName)
+    {
+        foreach (var attribute in attributes)
+        {
+            if (attribute.AttributeType.FullName != attributeName || attribute.ConstructorArguments.Count != 1)
+            {
+                continue;
+            }
+
+            var argument = attribute.ConstructorArguments[0];
+            if (argument.Value is byte single)
+            {
+                return single;
+            }
+
+            if (argument.Value is IReadOnlyCollection<CustomAttributeTypedArgument> { Count: > 0 } flags
+                && flags.First().Value is byte first)
+            {
+                return first;
+            }
+        }
+
+        return null;
+    }
+#endif
 
     internal static Type GetDeclaredResultType(Type returnType)
     {

@@ -56,7 +56,7 @@
   <ItemGroup>
     <EmbeddedResource Include="..\scripts\sdk\scriptbox.js" Condition="Exists('..\scripts\sdk\scriptbox.js')" LogicalName="ScriptBox.Js.sandbox-api.js" />
     <EmbeddedResource Include="..\scripts\dist\sdk\bootstrap-utils.js" Condition="Exists('..\scripts\dist\sdk\bootstrap-utils.js')" LogicalName="ScriptBox.Js.bootstrap-utils.js" />
-    <EmbeddedResource Include="..\ScriptBox.Wasm\scriptbox.wasm" Condition="Exists('..\ScriptBox.Wasm\scriptbox.wasm')" LogicalName="ScriptBox.Wasm.scriptbox.wasm" />
+    <EmbeddedResource Include="..\ScriptBox.Wasm\scriptbox-async.wasm" LogicalName="ScriptBox.Wasm.scriptbox-async.wasm" />
   </ItemGroup>
 
   <ItemGroup>

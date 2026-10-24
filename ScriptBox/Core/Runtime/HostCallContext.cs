@@ -15,6 +15,7 @@ public sealed class HostCallContext
         SandboxApiDescriptor api,
         SandboxMethodDescriptor method,
         IReadOnlyList<JsonElement> arguments,
+        IReadOnlyList<int> omittedArguments,
         ScriptSession session,
         JsonSerializerOptions jsonOptions,
         Func<SandboxApiDescriptor, object> resolveInstance,
@@ -23,6 +24,7 @@ public sealed class HostCallContext
         Api = api;
         MethodDescriptor = method;
         Arguments = arguments;
+        OmittedArguments = omittedArguments;
         Session = session;
         JsonOptions = jsonOptions;
         _resolveInstance = resolveInstance;
@@ -36,8 +38,14 @@ public sealed class HostCallContext
 
     public SandboxMethodDescriptor MethodDescriptor { get; }
 
-    /// <summary>The arguments as the script passed them. An undefined argument arrives as JSON null.</summary>
+    /// <summary>
+    /// The arguments as the script passed them. Trailing undefined arguments are left out. An undefined argument
+    /// before a given one holds JSON null and is listed in <see cref="OmittedArguments"/>.
+    /// </summary>
     public IReadOnlyList<JsonElement> Arguments { get; }
+
+    /// <summary>Positions in <see cref="Arguments"/> the script left undefined. They take the parameter's default.</summary>
+    public IReadOnlyList<int> OmittedArguments { get; }
 
     public ScriptSession Session { get; }
 

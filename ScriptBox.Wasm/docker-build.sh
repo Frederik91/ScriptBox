@@ -1,6 +1,6 @@
 #!/bin/bash
-# Builds both guest artifacts in the pinned container and writes them, with
-# artifacts.json, into ScriptBox.Wasm. Needs only Docker with Linux containers.
+# Builds the guest in the pinned container and writes it, with artifacts.json,
+# into ScriptBox.Wasm. Needs only Docker with Linux containers.
 #
 #   bash ScriptBox.Wasm/docker-build.sh
 #

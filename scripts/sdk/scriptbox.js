@@ -3,27 +3,24 @@
 // into console and __scriptbox.createMethod, then removes it from the global
 // scope so user code only reaches the host through registered APIs.
 //
-// Both hosts load this file. The guest's bridge decides the mode:
-// - ABI 1 (__host.call, the .NET host): a host call returns its value.
-// - ABI 2 (__host.post, the Node host): a host call returns a promise that the
-//   host settles later, values crossing the boundary must have an exact JSON
-//   form, and the bootstrap installs its resume and encode hooks with the
-//   guest, which keeps them out of the script's reach.
+// The .NET and the Node host both load this file, with the same guest (ABI 2).
+// A host call returns a promise that the host settles later, values crossing
+// the boundary must have an exact JSON form, and the bootstrap installs its
+// resume and encode hooks with the guest, which keeps them out of the
+// script's reach.
 (function (root) {
   'use strict';
 
   // Bumped when the contract between this file and a host changes. A host
   // that passes `bootstrap` in the options refuses to run against another.
-  var BOOTSTRAP_VERSION = 2;
+  var BOOTSTRAP_VERSION = 3;
 
   var host = root.__host;
   var options = root.__scriptbox_options || {};
   delete root.__host;
   delete root.__scriptbox_options;
 
-  var isAsync = !!host && typeof host.post === 'function';
-  if (!host || typeof host.log !== 'function'
-      || (isAsync ? typeof host.install !== 'function' : typeof host.call !== 'function')) {
+  if (!host || typeof host.log !== 'function' || typeof host.post !== 'function' || typeof host.install !== 'function') {
     throw new Error('The ScriptBox host bridge is missing.');
   }
 
@@ -69,57 +66,6 @@
     warn: logger(2),
     error: logger(3)
   });
-
-  // Arrays are left growable so a script can still push to a list it read.
-  function deepSeal(value) {
-    if (value === null || typeof value !== 'object') {
-      return value;
-    }
-    if (Array.isArray(value)) {
-      for (var i = 0; i < value.length; i++) {
-        value[i] = deepSeal(value[i]);
-      }
-      return value;
-    }
-    for (var key in value) {
-      if (Object.prototype.hasOwnProperty.call(value, key)) {
-        value[key] = deepSeal(value[key]);
-      }
-    }
-    return Object.seal(value);
-  }
-
-  function hostError(error) {
-    var result = new Error(error.message);
-    result.name = error.name || 'HostError';
-    return result;
-  }
-
-  // ---------- ABI 1: synchronous host calls ----------
-
-  // Trailing undefined arguments are dropped so the host can apply its
-  // parameter defaults; any other undefined becomes null, as JSON would.
-  function toArgs(args) {
-    var count = args.length;
-    while (count > 0 && typeof args[count - 1] === 'undefined') {
-      count--;
-    }
-    var list = new Array(count);
-    for (var i = 0; i < count; i++) {
-      list[i] = typeof args[i] === 'undefined' ? null : args[i];
-    }
-    return list;
-  }
-
-  function callHostSync(method, args) {
-    var response = JSON.parse(host.call(JSON.stringify({ method: method, args: toArgs(args || []) })));
-    if (response.error) {
-      throw hostError(response.error);
-    }
-    return options.sealResults ? deepSeal(response.result) : response.result;
-  }
-
-  // ---------- ABI 2: posted host calls ----------
 
   var MAX_DEPTH = typeof options.maxDepth === 'number' ? options.maxDepth : 64;
 
@@ -268,31 +214,33 @@
   function refusal(code, method) {
     switch (code) {
       case 0:
-        return asyncHostError({ name: 'RevokedError', message: method + ' was not called: this execution no longer accepts host calls.' });
+        return refusedError({ name: 'RevokedError', message: method + ' was not called: this execution no longer accepts host calls.' });
       case -1:
-        return asyncHostError({ name: 'QueueFullError', message: method + ' was not called: too many host calls are waiting. Await earlier calls first.' });
+        return refusedError({ name: 'QueueFullError', message: method + ' was not called: too many host calls are waiting. Await earlier calls first.' });
       case -2:
-        return asyncHostError({ name: 'RequestTooLargeError', message: method + ' was not called: its arguments are larger than one host call may carry.' });
+        return refusedError({ name: 'RequestTooLargeError', message: method + ' was not called: its arguments are larger than one host call may carry.' });
       default:
-        return asyncHostError({ name: 'HostError', message: method + ' was not called.' });
+        return refusedError({ name: 'HostError', message: method + ' was not called.' });
     }
   }
 
-  function callHostAsync(method, args) {
+  function callHost(method, args) {
     return new PromiseClass(function (resolve, reject) {
       if (typeof method !== 'string' || method.length === 0) {
         throw new TypeErrorClass('A host method name must be a non-empty string.');
       }
       var id = host.post(encodeRequest(method, args || []));
       if (id > 0) {
-        pending[id] = { resolve: resolve, reject: reject };
+        // Created now, while the script's frame is on the stack, so a failed
+        // call points at the line that made it rather than at the host's answer.
+        pending[id] = { resolve: resolve, reject: reject, site: new ErrorClass('') };
       } else {
         reject(refusal(id, method));
       }
     });
   }
 
-  function asyncHostError(error) {
+  function refusedError(error) {
     var result = new ErrorClass(error.message);
     result.name = error.name || 'HostError';
     return result;
@@ -323,7 +271,10 @@
     }
     delete pending[response.id];
     if (response.error) {
-      entry.reject(asyncHostError(response.error));
+      var error = entry.site;
+      error.message = response.error.message;
+      error.name = response.error.name || 'HostError';
+      entry.reject(error);
     } else {
       entry.resolve(options.sealResults ? sealDeep(response.result) : response.result);
     }
@@ -333,13 +284,7 @@
     return typeof value === 'undefined' ? undefined : encodeValue(value, 'The script\'s result', 0, []);
   }
 
-  if (isAsync) {
-    host.install({ protocol: 2, resume: resume, encode: encodeResult });
-  }
-
-  // ---------- Shared ----------
-
-  var callHost = isAsync ? callHostAsync : callHostSync;
+  host.install({ protocol: 2, resume: resume, encode: encodeResult });
 
   function createMethod(methodName) {
     if (typeof methodName !== 'string' || methodName.length === 0) {

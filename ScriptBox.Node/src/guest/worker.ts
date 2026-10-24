@@ -25,6 +25,7 @@ const SB_OK = 0;
 const SB_SCRIPT_ERROR = 1;
 const SB_PENDING = 4;
 const SB_UNHANDLED_REJECTION = 5;
+const SB_SYNTAX_ERROR = 7;
 
 // WASI errno values.
 const ERRNO_BADF = 8;
@@ -117,6 +118,10 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
 
   let nextId = 1;
   const outstanding = new Set<number>();
+  // Calls admitted during the current guest step. They reach the parent only
+  // once the step ends without failing, so a script that fails never starts
+  // the calls it made in its last step.
+  let posted: { id: number; payload: string; bytes: number }[] = [];
   let attempts = 0;
   let rpcBytes = 0;
   let logs = 0;
@@ -142,12 +147,27 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
 
   const nowMs = (): number => data.frozenClock ? data.clockStartMs : data.clockStartMs + (performance.now() - clockOrigin);
 
+  // The method's name leads the request the bootstrap writes.
+  const methodOf = (prefix: string): string => /^\{"method":"([^"\\]{0,256})"/.exec(prefix)?.[1] ?? '';
+
   const refuse = (ptr: number, len: number, reason: RefusalReason, code: number): number => {
-    // The method's name leads the request the bootstrap writes; read only that far.
-    const prefix = readBounded(ptr, len, methodPrefixBytes);
-    const match = /^\{"method":"([^"\\]{0,256})"/.exec(prefix);
-    send({ t: 'refused', method: match?.[1] ?? '', reason, bytes: len });
+    send({ t: 'refused', method: methodOf(readBounded(ptr, len, methodPrefixBytes)), reason, bytes: len });
     return code;
+  };
+
+  const sendPosted = (): void => {
+    for (const call of posted) {
+      send({ t: 'call', id: call.id, payload: call.payload, bytes: call.bytes });
+    }
+    posted = [];
+  };
+
+  const revokePosted = (): void => {
+    for (const call of posted) {
+      outstanding.delete(call.id);
+      send({ t: 'refused', method: methodOf(call.payload.slice(0, methodPrefixBytes)), reason: 'revoked', bytes: call.bytes });
+    }
+    posted = [];
   };
 
   const host = {
@@ -168,7 +188,7 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
       }
       const id = nextId++;
       outstanding.add(id);
-      send({ t: 'call', id, payload: read(ptr, len), bytes: len });
+      posted.push({ id, payload: read(ptr, len), bytes: len });
       return id;
     },
     limit: (): never => {
@@ -270,6 +290,7 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
 
   const fail = (kind: GuestErrorKind, fallback: string): void => {
     finished = true;
+    revokePosted();
     const error = lastError ?? { name: 'Error', message: fallback, stack: '' };
     send({ t: 'error', kind, name: error.name, message: error.message, stack: error.stack, memoryBytes: memoryBytes() });
   };
@@ -290,7 +311,7 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
   };
 
   // Acts on a status from sb_eval (mode 2) or sb_resume.
-  const handle = (status: number, starting: boolean): void => {
+  const handle = (status: number): void => {
     if (finished) {
       return;
     }
@@ -313,8 +334,12 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
         }
         return;
       }
+      if (status === SB_SYNTAX_ERROR) {
+        fail('syntax', 'The script did not compile.');
+        return;
+      }
       if (status === SB_SCRIPT_ERROR) {
-        fail(starting && lastError?.name === 'SyntaxError' ? 'syntax' : 'script', 'The script failed.');
+        fail('script', 'The script failed.');
         return;
       }
       fail('protocol', `The guest returned status ${status}.`);
@@ -333,8 +358,10 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
   const guard = (action: () => void): void => {
     try {
       action();
+      sendPosted();
     } catch (error) {
       finished = true;
+      revokePosted();
       if (error instanceof GuestStop) {
         send({ t: 'limit', limit: error.limit, detail: error.message, memoryBytes: memoryBytes() });
       } else if (error instanceof RangeError && /call stack/i.test(error.message)) {
@@ -360,7 +387,7 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
         return;
       }
     }
-    handle(evalScript(data.script.name, data.script.code, 2), true);
+    handle(evalScript(data.script.name, data.script.code, 2));
   });
 
   port.on('message', (raw: unknown) => {
@@ -377,7 +404,7 @@ function run(port: NonNullable<typeof parentPort>, data: GuestWorkerData): void 
       const encoded = encoder.encode(message.response);
       spendRpc(encoded.length);
       const [ptr, len] = write(encoded);
-      handle(resume(ptr, len), false);
+      handle(resume(ptr, len));
     });
   });
 }

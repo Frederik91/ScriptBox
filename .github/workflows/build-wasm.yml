@@ -13,7 +13,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Rebuilds both guest artifacts from the pinned inputs in toolchain.env.
+      # Rebuilds the guest from the pinned inputs in toolchain.env.
       - name: Build WASM modules
         run: bash ScriptBox.Wasm/docker-build.sh
 
@@ -29,7 +29,6 @@ jobs:
         with:
           name: scriptbox-wasm
           path: |
-            ScriptBox.Wasm/scriptbox.wasm
             ScriptBox.Wasm/scriptbox-async.wasm
             ScriptBox.Wasm/artifacts.json
           retention-days: 30
