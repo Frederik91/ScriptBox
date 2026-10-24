@@ -105,8 +105,11 @@
     };
   }
 
-  root.__scriptbox = {
-    hostCall: callHost,
-    createMethod: createMethod
-  };
+  // The global and its two functions cannot be replaced, so a script cannot change how other code reaches the
+  // host. The object stays extensible for bootstrap helpers. Every call, through a namespace or hostCall, still
+  // passes the host's filters.
+  var api = {};
+  Object.defineProperty(api, 'hostCall', { value: callHost, enumerable: true });
+  Object.defineProperty(api, 'createMethod', { value: createMethod, enumerable: true });
+  Object.defineProperty(root, '__scriptbox', { value: api, writable: false, enumerable: false, configurable: false });
 })(globalThis);

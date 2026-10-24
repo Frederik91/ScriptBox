@@ -17,6 +17,7 @@ public sealed class ScriptBox : IScriptBox
     private readonly Func<Type, object?>? _apiFactory;
     private readonly JsonSerializerOptions _jsonOptions;
     private readonly Lazy<string> _declarations;
+    private readonly IReadOnlyDictionary<Type, string> _typeOverrides;
 
     internal ScriptBox(
         WasmScriptExecutor executor,
@@ -37,9 +38,8 @@ public sealed class ScriptBox : IScriptBox
         _limits = limits;
         _jsonOptions = jsonOptions;
         Metadata = metadata;
-        _declarations = new Lazy<string>(
-            () => new TypeScriptDeclarationGenerator(jsonOptions, typeOverrides).Generate(apis),
-            LazyThreadSafetyMode.ExecutionAndPublication);
+        _typeOverrides = typeOverrides;
+        _declarations = new Lazy<string>(() => Declare(_ => true), LazyThreadSafetyMode.ExecutionAndPublication);
     }
 
     public IReadOnlyList<SandboxApiDescriptor> Apis { get; }
@@ -56,6 +56,16 @@ public sealed class ScriptBox : IScriptBox
     }
 
     public string GetTypeScriptDeclarations() => _declarations.Value;
+
+    public string GetTypeScriptDeclarations(Func<SandboxMethodDescriptor, bool> include) =>
+        Declare(include ?? throw new ArgumentNullException(nameof(include)));
+
+    // APIs registered with their own serializer are declared by a generator of their own, so their shapes are the ones sent.
+    private string Declare(Func<SandboxMethodDescriptor, bool> include) =>
+        string.Concat(Apis
+            .GroupBy(api => api.JsonOptions ?? _jsonOptions)
+            .Select(group => new TypeScriptDeclarationGenerator(group.Key, _typeOverrides).Generate(group, include))
+            .Where(text => text.Trim().Length > 0));
 
     internal ScriptExecutionResult Execute(ScriptSession session, string script, CancellationToken cancellationToken)
     {

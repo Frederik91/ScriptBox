@@ -43,6 +43,7 @@ A script is the body of an async function: `return` produces the result, `await`
 ## What a script sees
 
 - **Registered APIs**, one global per `[SandboxApi]` namespace. Arguments are bound to the C# parameters with System.Text.Json: objects, lists, enums as names, optional parameters with defaults, and nullable parameters. A wrong argument count or shape fails with a message naming the parameter.
+- **`docs`**, when the host adds the [docs namespace](#docs-namespace): read-only reference for the registered APIs and the host's own guides.
 - **`console.log/info/warn/error`**, captured in `ScriptExecutionResult.Logs`.
 - **Errors from the host**: an exception in a host method becomes a JavaScript `Error` the script can catch. Throw `ScriptApiException` to choose its name and to write a message for the script's author. An uncaught error ends the script with a stack that refers to the submitted source's line numbers.
 - **A fresh realm every time**: nothing a script defines survives into the next execution. State that should persist lives host-side, in API instances or `ScriptSession.Items`.
@@ -50,6 +51,82 @@ A script is the body of an async function: `return` produces the result, `await`
 ## TypeScript declarations
 
 `GetTypeScriptDeclarations()` declares every registered namespace and each type reachable from its signatures. `[Description]` on classes, methods, parameters, properties and enum members becomes JSDoc. Shapes are read from the serializer contract, so renamed and ignored properties, nullability, read-only members and `[JsonPolymorphic]` hierarchies (as discriminated unions) come out the way they are actually sent. For a type with a custom converter, declare it yourself with `WithTypeScriptType`.
+
+A large box does not have to go into the prompt whole. Pass a method filter to declare only part of it, with the types those methods reach. A namespace with no included method is left out:
+
+```csharp
+string core = box.GetTypeScriptDeclarations(m => m.JsNamespace is "tasks" or "docs");
+```
+
+The rest can stay reachable through the [docs namespace](#docs-namespace).
+
+## Host-call filters
+
+A filter runs around every call a script makes into a host API, before the arguments are bound. It is the place for a policy that applies to every method, such as approval, auditing or a dry run. A filter can do one of three things:
+
+- call `next()` to let the call through;
+- throw `ScriptApiException` to refuse it, which the script sees as a catchable error at the calling line;
+- return a `HostCallResult` of its own without running the method.
+
+`HostCallContext` carries the method's name, its raw JSON arguments, the session and the `MethodDescriptor`. The descriptor gives access to the method's attributes, so methods can declare what they do and one filter can decide for all of them. This dry run lets reads through and records every write instead of running it:
+
+```csharp
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class ChangesStateAttribute : Attribute;
+
+// On TaskApi:  [SandboxMethod("rename"), ChangesState] public void Rename(...)
+
+public sealed class DryRun(List<string> proposed) : IHostCallFilter
+{
+    public Task<HostCallResult> InvokeAsync(HostCallContext context, HostCallNext next)
+    {
+        if (context.MethodDescriptor.GetAttribute<ChangesStateAttribute>() is null)
+        {
+            return next();
+        }
+
+        proposed.Add($"{context.Method} {string.Join(", ", context.Arguments)}");
+        return Task.FromResult(HostCallResult.From(new { proposed = true }));
+    }
+}
+
+var box = ScriptBoxBuilder.Create()
+    .RegisterApisFrom<TaskApi>()
+    .UseHostCallFilter(new AuditLog())                  // every session
+    .Build();
+
+var session = box.CreateSession(o => o.UseHostCallFilter(new DryRun(proposed)));
+```
+
+Box filters run outside session filters, each in the order it was added. Every call passes them, including one made through the low-level `__scriptbox.hostCall`. A script cannot replace `__scriptbox` or its functions.
+
+## Docs namespace
+
+`WithDocs` adds a read-only `docs` namespace that a script can browse like a file tree:
+
+| Call | Returns |
+| --- | --- |
+| `docs.ls(path?)` | The files and folders directly in a folder, each with a one-line summary |
+| `docs.read(path \| paths)` | One file, or up to 20 at once; a missing path comes back with an error instead of content |
+| `docs.grep(pattern, path?, maxMatches?)` | Lines matching a case-insensitive regular expression, 50 by default and 200 at most |
+| `docs.search(query, top?)` | The files about a topic, best first, 8 by default |
+
+Under `/api` the box documents its own APIs, generated from their declarations. Each namespace gets a folder with a `README.md`, its full `index.d.ts`, and one `.d.ts` per function. Add your own guides next to them:
+
+```csharp
+var guides = new DocsTree()
+    .DescribeDirectory("/guides", "How to write scripts for this app.")
+    .AddFile("/guides/rules.md", "Rules every script follows.", File.ReadAllText("rules.md"));
+
+var box = ScriptBoxBuilder.Create()
+    .RegisterApisFrom<TaskApi>()
+    .WithDocs([guides])
+    .Build();
+```
+
+The `includeApi` parameter of `WithDocs` limits which APIs get a folder under `/api`. For docs held in a large or remote catalogue, implement `IDocsSource`. Such a source can list and read files on demand and leave grep empty, as long as search finds them.
+
+Together with a declaration filter, this keeps the prompt small. Show the model the core API up front and let it read the rest when a task needs it.
 
 ## Limits
 
@@ -72,6 +149,19 @@ var session = box.CreateSession(o => o.UseApi(new TaskApi(snapshot, changeSet)))
 
 Instances not supplied per session are created on first use through `WithApiFactory` (or `Activator`), once per box.
 
+## APIs with their own serializer
+
+Every API uses the box's `JsonSerializerOptions` (`WithJsonSerializerOptions`) unless it is registered with options of its own. Those options then apply to its arguments, its results and its declarations, so APIs written against different serializers can share one box:
+
+```csharp
+var box = ScriptBoxBuilder.Create()
+    .RegisterApisFrom(typeof(LegacyApi), null, snakeCaseOptions)   // { display_name: ... }
+    .RegisterApisFrom<TaskApi>()                                     // { displayName: ... }
+    .Build();
+```
+
+`AddFromObject` takes the same optional options.
+
 ## Sealed results
 
 With `SealHostResults()`, every object a host call returns is sealed recursively. Changing an existing property works, but assigning one the object does not have throws a `TypeError` at that line, so `item.nmae = 'x'` fails loudly instead of being silently ignored. Arrays stay growable.
@@ -80,7 +170,7 @@ With `SealHostResults()`, every object a host call returns is sealed recursively
 
 | Package | Description |
 | ------- | ----------- |
-| `ScriptBox` | Runtime, builder, API binding, TypeScript declarations |
+| `ScriptBox` | Runtime, builder, API binding, host-call filters, TypeScript declarations, docs namespace |
 | `ScriptBox.DependencyInjection` | Registers `IScriptBox` with `Microsoft.Extensions.DependencyInjection` |
 | `ScriptBox.SemanticKernel` | Exposes Semantic Kernel plugins as script APIs and a `run_js` kernel function |
 

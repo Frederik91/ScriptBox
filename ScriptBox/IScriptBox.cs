@@ -21,4 +21,10 @@ public interface IScriptBox
     /// model that writes scripts for this box.
     /// </summary>
     string GetTypeScriptDeclarations();
+
+    /// <summary>
+    /// Declarations for only the methods <paramref name="include"/> accepts, with the types those methods reach.
+    /// A namespace none of whose methods is included is left out.
+    /// </summary>
+    string GetTypeScriptDeclarations(Func<SandboxMethodDescriptor, bool> include);
 }
