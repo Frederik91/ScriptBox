@@ -1,0 +1,77 @@
+name: Publish npm
+
+# Publishes @frederik91/scriptbox when a tag node-vX.Y.Z is pushed. npm trusts
+# this workflow through OIDC (trusted publishing), so no npm token is stored.
+# On a pull request that changes the package's version or this file, it runs
+# the same steps with npm publish --dry-run.
+on:
+  push:
+    tags:
+      - "node-v*"
+  pull_request:
+    branches: [ main ]
+    paths:
+      - ".github/workflows/publish-npm.yml"
+      - "ScriptBox.Node/package.json"
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: ScriptBox.Node
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check the tag matches the package version
+        if: github.event_name == 'push'
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "${GITHUB_REF_NAME}" != "node-v${version}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match package.json version ${version}." >&2
+            exit 1
+          fi
+
+      # The package bundles this artifact, so it must be exactly what its pinned inputs build.
+      - name: Check the guest artifact is current
+        working-directory: .
+        run: |
+          bash ScriptBox.Wasm/docker-build.sh
+          git diff --exit-code -- ScriptBox.Wasm
+          test -z "$(git status --porcelain -- ScriptBox.Wasm)"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: ScriptBox.Node/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Packs the tarball and runs it in a clean Node 24 container with the network off.
+      - name: Package test
+        run: npm run test:package
+
+      # prepublishOnly builds, type-checks, lints, tests and checks build-info.ts first.
+      - name: Publish
+        run: |
+          npm --version
+          if [ "${{ github.event_name }}" = "push" ]; then
+            npm publish --access public
+          else
+            npm publish --access public --dry-run
+          fi

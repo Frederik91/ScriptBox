@@ -7,12 +7,15 @@ on:
     tags:
       - "v*"
 
+# A node-v* tag or release belongs to the npm package (publish-npm.yml), not to NuGet.
 jobs:
   build-wasm:
+    if: startsWith(github.ref_name, 'v')
     uses: ./.github/workflows/build-wasm.yml
 
   publish-prerelease:
     needs: build-wasm
+    if: startsWith(github.ref_name, 'v')
     runs-on: ubuntu-latest
 
     steps:
