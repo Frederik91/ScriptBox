@@ -1,6 +1,6 @@
 {
   "name": "@frederik91/scriptbox",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Run untrusted, AI-written JavaScript and TypeScript in Node.js against the APIs you register: QuickJS in WebAssembly, async host calls, policy filters, limits and evidence.",
   "license": "MIT",
   "author": "Frederik Tegnander",
