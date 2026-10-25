@@ -2,13 +2,13 @@
 
 Run untrusted JavaScript and TypeScript, such as code an AI wrote, inside a Node.js server. Scripts run in QuickJS compiled to WebAssembly, in a worker thread. They can reach only the methods you register, and every call they make passes your policy and schema checks before your code runs.
 
-This is the Node host of [ScriptBox](https://github.com/Frederik91/ScriptBox). The .NET host shares its guest, its bootstrap and a set of conformance fixtures.
+It is part of [ScriptBox](https://github.com/Frederik91/ScriptBox).
 
 ## Requirements
 
 - Node.js 24 or later. ESM only.
-- No .NET, C compiler or WASI SDK. The package bundles its WebAssembly guest and needs no network at run time.
-- Tested on Windows 11 x64 with Node 24.18.0 and on Linux x64 (Debian bookworm, `node:24-bookworm-slim`) with Node 24.22.1. Other platforms that run Node 24 should work, because the package holds no native code, but they are not tested.
+- No native code and no build tools. The package bundles its WebAssembly guest and needs no network at run time.
+- Tested on Windows 11 x64 with Node 24.18.0 and on Linux x64 (Debian bookworm, `node:24-bookworm-slim`) with Node 24.22.1. Other platforms that run Node 24 should work, but they are not tested.
 
 ```sh
 npm install @frederik91/scriptbox
@@ -211,9 +211,9 @@ Known limitations:
 - ScriptBox cannot undo side effects a handler causes outside your draft, or make them happen exactly once. Make retried external operations idempotent in your application.
 - The guest worker's V8 heap limit does not bound large strings in practice. Its host-side buffers are bounded by the message, result and log limits instead.
 
-## The .NET host
+## ScriptBox for .NET
 
-The .NET host, ScriptBox 4, runs the same guest, `scriptbox-async.wasm` (guest ABI 2), and the same `scriptbox.js` bootstrap, version 3. Each host refuses a guest or bootstrap of another version before a script runs.
+ScriptBox also has a .NET host, the `ScriptBox` package on NuGet. You need it only to run scripts from a .NET application. Version 4 runs the same guest, `scriptbox-async.wasm` (guest ABI 2), and the same `scriptbox.js` bootstrap, version 3. Each host refuses a guest or bootstrap of another version before a script runs.
 
 `conformance/fixtures.json` holds cases both hosts run, and every case expects the same result from both. They cover values, defaults, `undefined` and `null`, void methods, errors and their lines, unawaited calls, unhandled rejections, the outstanding-call limit, filters, sealing and docs.
 
