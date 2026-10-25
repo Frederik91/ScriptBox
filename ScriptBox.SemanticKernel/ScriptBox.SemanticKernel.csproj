@@ -7,10 +7,10 @@
     <LangVersion>12</LangVersion>
     <PackageId>ScriptBox.SemanticKernel</PackageId>
     <Authors>ScriptBox</Authors>
-    <Description>Semantic Kernel integration helpers for ScriptBox.</Description>
+    <Description>Give a Semantic Kernel agent a ScriptBox tool, so it writes one JavaScript program against your registered APIs instead of calling a function per step.</Description>
     <RepositoryUrl>https://github.com/FredTegnander/ScriptSandboxPoC</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageTags>sandbox wasm semantic-kernel quickjs</PackageTags>
+    <PackageTags>sandbox wasm semantic-kernel quickjs ai llm agents</PackageTags>
   </PropertyGroup>
 
   <ItemGroup>

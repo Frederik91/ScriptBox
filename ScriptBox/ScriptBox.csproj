@@ -7,10 +7,10 @@
     <Nullable>enable</Nullable>
     <PackageId>ScriptBox</PackageId>
     <Authors>ScriptBox</Authors>
-    <Description>QuickJS-in-WASM sandbox runtime for .NET applications.</Description>
+    <Description>Let an AI model write JavaScript against your .NET API. ScriptBox runs it in a QuickJS WebAssembly sandbox inside your process, where it reaches only the methods you register, your filters check every call, and time and memory limits stop runaway code.</Description>
     <RepositoryUrl>https://github.com/FredTegnander/ScriptSandboxPoC</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
-    <PackageTags>sandbox wasm javascript quickjs</PackageTags>
+    <PackageTags>sandbox wasm javascript quickjs ai llm agents</PackageTags>
     <IncludeSymbols>false</IncludeSymbols>
     <GenerateDocumentationFile>false</GenerateDocumentationFile>
     <LangVersion>latest</LangVersion>

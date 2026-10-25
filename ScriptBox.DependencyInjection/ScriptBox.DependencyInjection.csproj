@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <PackageId>ScriptBox.DependencyInjection</PackageId>
     <Authors>ScriptBox</Authors>
-    <Description>Microsoft.Extensions.DependencyInjection helpers for the ScriptBox sandbox runtime.</Description>
+    <Description>Register ScriptBox, the sandbox for AI-written JavaScript, and its APIs with Microsoft.Extensions.DependencyInjection.</Description>
     <RepositoryUrl>https://github.com/FredTegnander/ScriptSandboxPoC</RepositoryUrl>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
     <PackageTags>sandbox wasm dependency-injection</PackageTags>

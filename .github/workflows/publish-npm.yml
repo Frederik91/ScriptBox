@@ -1,9 +1,10 @@
 name: Publish npm
 
-# Publishes @frederik91/scriptbox when a tag node-vX.Y.Z is pushed. npm trusts
-# this workflow through OIDC (trusted publishing), so no npm token is stored.
-# On a pull request that changes the package's version or this file, it runs
-# the same steps with npm publish --dry-run.
+# Stages @frederik91/scriptbox on npm when a tag node-vX.Y.Z is pushed. npm
+# trusts this workflow through OIDC (trusted publishing), so no npm token is
+# stored, and the trusted publisher allows staging only: a maintainer approves
+# each version with 2FA before it goes live. On a pull request that changes the
+# package's version or this file, it runs the same steps as a dry run.
 on:
   push:
     tags:
@@ -48,13 +49,13 @@ jobs:
           git diff --exit-code -- ScriptBox.Wasm
           test -z "$(git status --porcelain -- ScriptBox.Wasm)"
 
+      # v6.1 and later write no always-auth, which npm 11 warns about. No dependency cache:
+      # a release must not restore files a pull request run could have written.
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24.x
           registry-url: https://registry.npmjs.org
-          cache: npm
-          cache-dependency-path: ScriptBox.Node/package-lock.json
 
       - name: Install
         run: npm ci
@@ -66,12 +67,19 @@ jobs:
       - name: Package test
         run: npm run test:package
 
+      # Stages the version on npm; it goes live only when a maintainer approves it with 2FA.
       # prepublishOnly builds, type-checks, lints, tests and checks build-info.ts first.
-      - name: Publish
+      - name: Stage on npm
         run: |
           npm --version
+          version="$(node -p "require('./package.json').version")"
           if [ "${{ github.event_name }}" = "push" ]; then
-            npm publish --access public
+            npm stage publish --access public
+          elif npm view "@frederik91/scriptbox@${version}" version > /dev/null 2>&1; then
+            # npm refuses even a dry run of a published version, so check the release path without it.
+            echo "${version} is already on npm, so this checks the package without staging it."
+            npm run prepublishOnly
+            npm pack --dry-run
           else
-            npm publish --access public --dry-run
+            npm stage publish --access public --dry-run
           fi

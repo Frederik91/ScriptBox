@@ -39,17 +39,19 @@ Location: `.github/workflows/publish-npm.yml`. It publishes `@frederik91/scriptb
 
 - **Triggers**:
   - Pushing a tag `node-vX.Y.Z`. The tag must match `version` in `ScriptBox.Node/package.json`, or the job fails before it builds.
-  - A pull request to `main` that changes `ScriptBox.Node/package.json` or this workflow. It runs every step with `npm publish --dry-run`, so a version bump is checked before it is tagged.
+  - A pull request to `main` that changes `ScriptBox.Node/package.json` or this workflow. It runs every step with `npm stage publish --dry-run`, so a version bump is checked before it is tagged. If the version is already on npm, which refuses even a dry run of it, it runs the checks and `npm pack --dry-run` instead.
 - **Steps**:
   1. Rebuild the guest from its pinned inputs and fail if it differs from the committed artifact.
   2. `npm ci` and `npm run build`.
   3. Pack the tarball and run it in a clean Node 24 container with the network off.
-  4. `npm publish --access public`. Its `prepublishOnly` script builds, type-checks, lints, tests and checks `build-info.ts` first.
+  4. `npm stage publish --access public`. Its `prepublishOnly` script builds, type-checks, lints, tests and checks `build-info.ts` first.
 - **Authentication**: npm trusted publishing. npm trusts this workflow file through OIDC (`id-token: write`), so there is no npm token in the repository secrets. npm adds a provenance attestation to each version.
+- **Staged publishing**: the trusted publisher on npmjs.com allows `npm stage publish` only, not `npm publish`. The workflow puts the version in the package's stage queue, and nothing is installable until a maintainer approves it with 2FA, on the package's Staged Packages tab or with `npm stage approve <stage-id>`. CI cannot approve, because the OIDC token cannot pass the 2FA challenge.
 - **Releasing a version**:
   1. Raise `version` in `ScriptBox.Node/package.json` in a pull request, and merge it once the dry run passes.
   2. Tag the merge commit on `main` with `node-vX.Y.Z` and push the tag, or create a GitHub Release with that tag.
-  3. Check the Actions run and the version on npmjs.com.
+  3. When the run has passed, approve the staged version with 2FA: `npm stage list @frederik91/scriptbox`, then `npm stage approve <stage-id>`, or the Staged Packages tab on npmjs.com.
+  4. Check that the version on npmjs.com shows its provenance.
 
 The npm package is versioned on its own. A NuGet release does not publish it, and an npm release does not publish NuGet.
 
