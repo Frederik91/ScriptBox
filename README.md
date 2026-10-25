@@ -202,7 +202,7 @@ ScriptBox 4 gives the .NET host the Node host's contract. Scripts and hosts need
 | `ScriptBox` | Runtime, builder, API binding, host-call filters, TypeScript declarations, docs namespace |
 | `ScriptBox.DependencyInjection` | Registers `IScriptBox` with `Microsoft.Extensions.DependencyInjection` |
 | `ScriptBox.SemanticKernel` | Exposes Semantic Kernel plugins as script APIs and a `run_js` kernel function |
-| `@frederik91/scriptbox` (npm, `ScriptBox.Node/`) | The Node host. Not published yet. |
+| `@frederik91/scriptbox` (npm, `ScriptBox.Node/`) | The Node host. Released from `node-v*` tags, see `docs/ci.md`. |
 
 ## Performance
 
