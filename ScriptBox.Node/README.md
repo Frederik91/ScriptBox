@@ -1,8 +1,35 @@
 # @frederik91/scriptbox
 
-Run untrusted JavaScript and TypeScript, such as code an AI wrote, inside a Node.js server. Scripts run in QuickJS compiled to WebAssembly, in a worker thread. They can reach only the methods you register, and every call they make passes your policy and schema checks before your code runs.
+Let an AI model work with your application by writing code. The model writes a short JavaScript or TypeScript program against the API you register, and ScriptBox runs it in a sandbox inside your Node.js server. The program can call only your methods, and your schemas and policies check every call before your code runs.
 
-It is part of [ScriptBox](https://github.com/Frederik91/ScriptBox).
+One program can do the work of a dozen tool calls. It can look up twenty records, work out what to change and stage that change in a single run, so the model needs no round trip per step and you get one result back. With `tasks` and `draft` namespaces registered, a run looks like this:
+
+```ts
+const outcome = await session.execute({
+  language: 'typescript',
+  source: `
+    const overdue = await tasks.list({ status: 'open', dueBefore: '2026-11-01' });
+    for (const task of overdue) {
+      await draft.reassign({ id: task.id, to: 'triage' });
+    }
+    return { moved: overdue.length };
+  `,
+});
+```
+
+## Why use it
+
+- **Scripts reach only what you register.** A script has the JavaScript language, `console` and your namespaces. It has no `process`, `require`, file system, network, timers or environment. It runs in QuickJS compiled to WebAssembly, in its own worker thread.
+- **One schema per method.** You describe each method once with TypeBox. ScriptBox derives argument validation, result checks, the TypeScript declarations for the model's prompt and the docs the model can browse from that schema, so they cannot drift apart.
+- **Your handlers stay async.** A handler is an ordinary async function, so a script can `await` your database, search index or HTTP service.
+- **Limits a script cannot escape.** Time, memory, host calls, bytes and result size are hard limits. Cancelling stops even an endless loop or a long native operation. In the benchmark the outcome arrives within 6 ms of `abort()`.
+- **Policy on every call.** Filters can let a call through, refuse it or answer in its place. Capabilities decide per request what a script may call, so a read-only session cannot write even when it finds the method in the docs.
+- **Changes wait for approval.** A script stages changes in your draft. You validate the draft and apply it outside the script, so a model can propose a change but never approve one. `examples/catalog` shows the whole flow.
+- **Evidence for every run.** Each outcome records every call attempt and its result, the source's hash and the versions that ran. An audit sink can stop a run when it cannot record a call.
+- **Cheap enough to run per request.** A warm run takes about 22 ms and a host call about 0.08 ms on a desktop CPU. The figures and raw samples are in `bench/README.md`.
+- **Plain npm.** No native code and no build tools. Node 24 or later.
+
+It is part of [ScriptBox](https://github.com/Frederik91/ScriptBox), which also has a .NET host on NuGet.
 
 ## Requirements
 

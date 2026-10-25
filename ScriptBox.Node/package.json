@@ -1,7 +1,7 @@
 {
   "name": "@frederik91/scriptbox",
   "version": "0.1.1",
-  "description": "Run untrusted, AI-written JavaScript and TypeScript in Node.js against the APIs you register: QuickJS in WebAssembly, async host calls, policy filters, limits and evidence.",
+  "description": "Let an AI model write JavaScript or TypeScript against your Node.js API. ScriptBox runs it in a QuickJS WebAssembly sandbox where it reaches only the methods you register, your schemas and policies check every call, and hard limits stop runaway code.",
   "license": "MIT",
   "author": "Frederik Tegnander",
   "repository": {
@@ -13,8 +13,11 @@
     "sandbox",
     "quickjs",
     "wasm",
+    "javascript",
     "typescript",
+    "ai",
     "llm",
+    "agents",
     "code-execution"
   ],
   "type": "module",
