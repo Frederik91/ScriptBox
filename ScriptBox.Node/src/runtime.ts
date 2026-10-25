@@ -49,7 +49,7 @@ export interface RuntimeOptions<Context> {
 
 /** The registered contract, as discovery and policy see it. */
 export interface ContractInfo {
-  /** SHA-256 of every namespace, method, schema, effect and description. */
+  /** * SHA-256 of every namespace, method, schema, effect, concurrency and description. */
   readonly sha256: string;
   readonly version: string | null;
   readonly namespaces: readonly { readonly name: string; readonly description: string | undefined; readonly methods: readonly MethodDescriptor[] }[];

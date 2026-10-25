@@ -18,6 +18,9 @@ internal sealed class ExecutionLimits
 
     /// <summary>Calls a script has made and the host has not yet answered. The same default as the Node host.</summary>
     public int MaxOutstandingCalls { get; init; } = 16;
+
+    /// <summary>Calls to concurrent methods that run at the same time. The same default as the Node host.</summary>
+    public int MaxConcurrentCalls { get; init; } = 4;
 }
 
 internal sealed record BootstrapScript(string Name, string Code);
@@ -29,7 +32,9 @@ internal sealed record BootstrapScript(string Name, string Code);
 /// <remarks>
 /// A host call is posted: the guest returns to the host with the call queued,
 /// the host answers it, and <c>sb_resume</c> settles the script's promise.
-/// Calls are answered one at a time, in the order the script made them.
+/// Calls start in the order the script made them, one at a time, except that
+/// calls to methods marked <see cref="SandboxMethodAttribute.Concurrent"/> run
+/// together. The guest is resumed with each answer as it arrives.
 /// <see cref="Execute"/> blocks its thread for the whole execution, host calls
 /// included: Wasmtime runs the guest on the calling thread's native stack, and
 /// QuickJS's recursion needs more of it than a thread-pool thread has.
@@ -128,6 +133,10 @@ internal sealed class WasmScriptExecutor
         catch (WasmtimeException ex)
         {
             error = new ScriptError(ScriptErrorKind.Fault, "SandboxFault", ex.InnerException?.Message ?? FirstLine(ex.Message), null, null);
+        }
+        finally
+        {
+            run.EndCalls(linked.Cancel);
         }
 
         // Only a run the interrupt actually stopped is a timeout. One that finished while the timer fired keeps its result.
@@ -330,6 +339,25 @@ internal sealed class WasmScriptExecutor
     {
     }
 
+    /// <summary>A call the script made: answered at once when it names no host method, otherwise run by its handler.</summary>
+    private sealed class PostedCall
+    {
+        public PostedCall(int id) => Id = id;
+
+        public int Id { get; }
+
+        public HostMethod? Method { get; init; }
+
+        public HostCallContext? Context { get; init; }
+
+        public byte[]? Response { get; init; }
+
+        public Task<HostCallResult>? Task { get; set; }
+
+        // A call answered at once runs no handler, so it can share its turn with anything.
+        public bool Concurrent => Method is null || Method.Descriptor.Concurrent;
+    }
+
     private sealed class ExecutionStoppedException : Exception
     {
     }
@@ -374,7 +402,8 @@ internal sealed class WasmScriptExecutor
         private readonly CancellationToken _token;
         private readonly List<ScriptLogEntry> _logs = new();
         private readonly List<HostCallError> _hostErrors = new();
-        private readonly Queue<(int Id, string Payload)> _queue = new();
+        private readonly Queue<PostedCall> _queue = new();
+        private readonly List<PostedCall> _running = new();
         private Memory? _memory;
         private (string Name, string Message, string Stack)? _error;
         private int _interrupt;
@@ -425,7 +454,7 @@ internal sealed class WasmScriptExecutor
         }
 
         /// <summary>
-        /// Answers the script's posted calls, one at a time in the order it made them, until its outcome is known.
+        /// Answers the script's posted calls until its outcome is known, settling each as its handler finishes.
         /// <paramref name="status"/> is what starting the script returned.
         /// </summary>
         public ScriptError? Drive(int status, Func<byte[], int> resume, Func<int> finish)
@@ -436,7 +465,7 @@ internal sealed class WasmScriptExecutor
                 {
                     if (status == SbPending)
                     {
-                        if (_queue.Count == 0)
+                        if (_queue.Count == 0 && _running.Count == 0)
                         {
                             return new ScriptError(
                                 ScriptErrorKind.Exception,
@@ -467,7 +496,9 @@ internal sealed class WasmScriptExecutor
                     return TakeError(status == SbScriptError ? ScriptErrorKind.Exception : ScriptErrorKind.Fault, status == SbScriptError ? null : "internal");
                 }
 
-                if (_queue.Count == 0)
+                ThrowIfStopping();
+                StartCalls();
+                if (_running.Count == 0)
                 {
                     var finished = finish();
                     if (finished == SbUnhandledRejection)
@@ -479,12 +510,93 @@ internal sealed class WasmScriptExecutor
                     return finished == SbOk ? null : TakeError(ScriptErrorKind.Fault, "internal");
                 }
 
-                ThrowIfStopping();
-                var (id, payload) = _queue.Dequeue();
-                var response = Dispatch(id, payload);
+                var response = Complete(TakeFinishedCall());
                 ThrowIfStopping();
                 status = resume(response);
             }
+        }
+
+        /// <summary>
+        /// Cancels the calls still running once the execution has its outcome, and waits for them, so no handler
+        /// runs after the execution returns. A script that failed while awaiting one call can leave others running.
+        /// </summary>
+        public void EndCalls(Action cancel)
+        {
+            _queue.Clear();
+            if (_running.Count == 0)
+            {
+                return;
+            }
+
+            try
+            {
+                cancel();
+            }
+            catch (AggregateException)
+            {
+                // A callback a handler registered on the token threw. The calls still end.
+            }
+
+            foreach (var call in _running)
+            {
+                try
+                {
+                    call.Task?.GetAwaiter().GetResult();
+                }
+                catch (Exception ex) when (Unwrap(ex) is not (OperationCanceledException or ScriptApiException))
+                {
+                    _hostErrors.Add(new HostCallError(call.Method!.Descriptor.HostMethodName, Unwrap(ex)));
+                }
+                catch (Exception)
+                {
+                    // Cancelled, or an error meant for a script that is no longer listening.
+                }
+            }
+
+            _running.Clear();
+        }
+
+        // Starts queued calls in the order the script made them. A concurrent call joins running concurrent calls
+        // while there is a slot; any other call starts only when nothing runs, and the calls after it wait for it.
+        private void StartCalls()
+        {
+            while (_queue.Count > 0)
+            {
+                var next = _queue.Peek();
+                if (_running.Count > 0
+                    && !(next.Concurrent && _running[0].Concurrent && _running.Count < _limits.MaxConcurrentCalls))
+                {
+                    return;
+                }
+
+                _queue.Dequeue();
+                if (next.Response is null)
+                {
+                    var method = next.Method!;
+                    var context = next.Context!;
+                    // A concurrent call starts on the thread pool, so a handler that does synchronous work before
+                    // its first await does not hold up the next one. Any other call starts on this thread, as before.
+                    next.Task = next.Concurrent
+                        ? Task.Run(() => Invoke(method, context))
+                        : Start(method, context);
+                }
+
+                _running.Add(next);
+            }
+        }
+
+        // Waits for a running call to finish. When several have, the one the script made first is taken.
+        private PostedCall TakeFinishedCall()
+        {
+            var index = _running.FindIndex(call => call.Task is null or { IsCompleted: true });
+            if (index < 0)
+            {
+                index = Task.WaitAny(_running.Select(call => call.Task!).ToArray());
+            }
+
+            var finished = _running[index];
+            _running.RemoveAt(index);
+            return finished;
         }
 
         public void DefineImports(Linker linker, Store store, Memory memory)
@@ -539,13 +651,13 @@ internal sealed class WasmScriptExecutor
                 return 0;
             }
 
-            if (_queue.Count >= _limits.MaxOutstandingCalls)
+            if (_queue.Count + _running.Count >= _limits.MaxOutstandingCalls)
             {
                 return -1;
             }
 
             var id = _nextId++;
-            _queue.Enqueue((id, ReadString(ptr, len)));
+            _queue.Enqueue(Prepare(id, ReadString(ptr, len)));
             return id;
         }
 
@@ -572,7 +684,8 @@ internal sealed class WasmScriptExecutor
             _logs.Add(new ScriptLogEntry(logLevel, message));
         }
 
-        private byte[] Dispatch(int id, string payload)
+        // Reads the call when the script makes it. One that names no host method is answered at once.
+        private PostedCall Prepare(int id, string payload)
         {
             string method;
             JsonElement[] arguments;
@@ -591,21 +704,35 @@ internal sealed class WasmScriptExecutor
             }
             catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException or FormatException)
             {
-                return ErrorResponse(id, "UnknownMethodError", "The host call was malformed.");
+                return new PostedCall(id) { Response = ErrorResponse(id, "UnknownMethodError", "The host call was malformed.") };
             }
 
             if (!_owner._methods.TryGetValue(method, out var hostMethod))
             {
                 var shown = method.Length > 128 ? method.Substring(0, 128) : method;
-                return ErrorResponse(id, "UnknownMethodError", $"'{shown}' is not a host API method.");
+                return new PostedCall(id) { Response = ErrorResponse(id, "UnknownMethodError", $"'{shown}' is not a host API method.") };
             }
 
-            var context = new HostCallContext(
-                hostMethod.Api, hostMethod.Descriptor, arguments, omitted, _session, hostMethod.Api.JsonOptions ?? _owner._jsonOptions, _resolveInstance, _token);
+            return new PostedCall(id)
+            {
+                Method = hostMethod,
+                Context = new HostCallContext(
+                    hostMethod.Api, hostMethod.Descriptor, arguments, omitted, _session, hostMethod.Api.JsonOptions ?? _owner._jsonOptions, _resolveInstance, _token),
+            };
+        }
+
+        private byte[] Complete(PostedCall call)
+        {
+            if (call.Response is { } response)
+            {
+                return response;
+            }
+
+            var hostMethod = call.Method!;
             try
             {
-                var result = Invoke(hostMethod, context).GetAwaiter().GetResult();
-                return ResultResponse(id, hostMethod, result, context.JsonOptions);
+                var result = call.Task!.GetAwaiter().GetResult();
+                return ResultResponse(call.Id, hostMethod, result, call.Context!.JsonOptions);
             }
             catch (OperationCanceledException) when (InterruptRequested)
             {
@@ -613,8 +740,31 @@ internal sealed class WasmScriptExecutor
             }
             catch (Exception ex)
             {
-                return ExceptionResponse(id, hostMethod.Descriptor.HostMethodName, ex);
+                return ExceptionResponse(call.Id, hostMethod.Descriptor.HostMethodName, ex);
             }
+        }
+
+        // A handler or filter that throws before returning its task fails the call the same way as one whose task faults.
+        private Task<HostCallResult> Start(HostMethod hostMethod, HostCallContext context)
+        {
+            try
+            {
+                return Invoke(hostMethod, context);
+            }
+            catch (Exception ex)
+            {
+                return Task.FromException<HostCallResult>(ex);
+            }
+        }
+
+        private static Exception Unwrap(Exception ex)
+        {
+            while (ex is AggregateException { InnerException: { } inner })
+            {
+                ex = inner;
+            }
+
+            return ex;
         }
 
         private Task<HostCallResult> Invoke(HostMethod hostMethod, HostCallContext context)
@@ -671,11 +821,7 @@ internal sealed class WasmScriptExecutor
         // so the script sees that the method failed and the exception goes to ScriptExecutionResult.HostErrors.
         private byte[] ExceptionResponse(int id, string method, Exception ex)
         {
-            while (ex is AggregateException { InnerException: { } inner })
-            {
-                ex = inner;
-            }
-
+            ex = Unwrap(ex);
             if (ex is ScriptApiException api)
             {
                 return ErrorResponse(id, api.ErrorName, api.Message);

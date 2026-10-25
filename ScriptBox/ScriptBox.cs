@@ -78,6 +78,7 @@ public sealed class ScriptBox : IScriptBox
                 MaxLogEntries = _limits.MaxLogEntries,
                 MaxLogEntryLength = _limits.MaxLogEntryLength,
                 MaxResultBytes = _limits.MaxResultBytes,
+                MaxConcurrentCalls = _limits.MaxConcurrentCalls,
             };
 
         return _executor.Execute(

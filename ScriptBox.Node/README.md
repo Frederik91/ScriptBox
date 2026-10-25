@@ -183,6 +183,7 @@ Set them on the runtime, the session or one execution. A script cannot change th
 | `rpcBytes`, all requests and responses | 4 MiB | Hard |
 | `hostCalls`, all attempts | 128 | Hard |
 | `outstandingCalls` | 16 | Excess calls fail with `QueueFullError` before they start |
+| `concurrentCalls` | 4 | Calls to concurrent methods running at once; further ones wait |
 | `resultBytes`, the returned value | 256 KiB | Hard |
 | `logEntries` and `logEntryBytes` | 100 of 2 KiB | Soft: cut and dropped, marked in `truncated` |
 | `evidenceRecords` and `evidenceBytes` | 128, 256 KiB | Hard: a call that cannot be recorded stops the execution |
@@ -197,7 +198,7 @@ The guest worker copies nothing larger than `messageBytes`, `resultBytes` or `lo
 
 - Pass `signal` to `execute`. Cancelling, the deadline and `dispose` all terminate the worker, which stops the guest even inside a long native operation. In the test suite the worker stops within 1 to 8 ms and the outcome arrives within 20 ms.
 - When an execution ends, every call in progress loses its authority. Its signal aborts, its result is discarded and recorded as `revoked`, and `throwIfRevoked` throws.
-- Host calls run one at a time, in the order the script made them, even under `Promise.all`.
+- Host calls start in the order the script made them, one at a time, even under `Promise.all`. The exception is a method registered with `concurrent: true`: calls to such methods run together, up to `concurrentCalls`, and each settles when its handler finishes. Set it only when the handler, and the filters it passes through, are safe to run interleaved with themselves and the other concurrent methods, typically a read. Any other call runs alone: it starts once the calls made before it have finished, and the calls made after it wait for it.
 - If a script returns while calls it did not await are pending, those calls finish before the outcome, and no new call is admitted. If one of them fails, the execution fails with `unhandled-rejection`. If the script fails, pending calls are revoked at once.
 
 ## Evidence and events

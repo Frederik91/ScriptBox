@@ -39,6 +39,9 @@ public sealed record SandboxMethodDescriptor(string JsNamespace, string JsMethod
     /// <summary>The first sentence of <see cref="Description"/>, for listings.</summary>
     public string? Summary => Text.FirstSentence(Description);
 
+    /// <summary>Whether calls may run alongside other concurrent calls. See <see cref="SandboxMethodAttribute.Concurrent"/>.</summary>
+    public bool Concurrent { get; } = Method.GetCustomAttribute<SandboxMethodAttribute>()?.Concurrent == true;
+
     public T? GetAttribute<T>() where T : Attribute => Method.GetCustomAttribute<T>();
 }
 
