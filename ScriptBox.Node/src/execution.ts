@@ -136,6 +136,8 @@ interface QueuedCall {
   readonly receivedAt: number;
   /** Whether it may run alongside other concurrent calls; set when it reaches the head of the queue. */
   concurrent?: boolean;
+  /** The request, once read to decide {@link concurrent}, so it is read only once. */
+  request?: { method: string; args: JsonValue[]; omitted: number[] };
 }
 
 type Terminal =
@@ -725,13 +727,12 @@ class ExecutionRun<Context> {
 
   /** A call that names no host method is answered without a handler, so it can share its turn with anything. */
   private isConcurrent(queued: QueuedCall): boolean {
-    let method: string;
     try {
-      method = readRequest(queued.payload, this.limits).method;
+      queued.request = readRequest(queued.payload, this.limits);
     } catch {
       return true;
     }
-    return this.runtime.methods.get(method)?.descriptor.concurrent ?? true;
+    return this.runtime.methods.get(queued.request.method)?.descriptor.concurrent ?? true;
   }
 
   /** Handles one admitted call and returns the response for the guest, or undefined when the execution has ended. */
@@ -740,7 +741,7 @@ class ExecutionRun<Context> {
     const startedAtMs = this.elapsedMs();
     let request: { method: string; args: JsonValue[]; omitted: number[] };
     try {
-      request = readRequest(queued.payload, this.limits);
+      request = queued.request ?? readRequest(queued.payload, this.limits);
     } catch {
       return this.respondError(queued, startedAtMs, started, null, 'unknown-method', 'UnknownMethodError', 'The host call was malformed.', false, undefined, '');
     }

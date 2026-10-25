@@ -368,7 +368,8 @@ export function contractDigest(namespaces: readonly { name: string; description:
       description: m.description ?? null,
       effect: m.effect,
       timeoutMs: m.timeoutMs ?? null,
-      concurrent: m.concurrent,
+      // Only when set, so a contract that opts nothing in keeps the digest it had before concurrency existed.
+      ...(m.concurrent ? { concurrent: true } : {}),
       metadata: m.metadata,
       params: m.params.map((p) => ({ name: p.name, optional: p.optional, schema: p.schema })),
       result: m.result ?? null,

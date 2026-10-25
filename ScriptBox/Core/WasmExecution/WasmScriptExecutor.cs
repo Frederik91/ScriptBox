@@ -496,8 +496,13 @@ internal sealed class WasmScriptExecutor
                     return TakeError(status == SbScriptError ? ScriptErrorKind.Exception : ScriptErrorKind.Fault, status == SbScriptError ? null : "internal");
                 }
 
-                ThrowIfStopping();
-                StartCalls();
+                // A script with nothing left to answer keeps its outcome even when the timer fires now.
+                if (_queue.Count > 0 || _running.Count > 0)
+                {
+                    ThrowIfStopping();
+                    StartCalls();
+                }
+
                 if (_running.Count == 0)
                 {
                     var finished = finish();

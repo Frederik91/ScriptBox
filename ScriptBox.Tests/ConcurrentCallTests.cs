@@ -49,6 +49,14 @@ public class ConcurrentCallTests
             throw new ScriptApiException("Failed on purpose.", "PurposeError");
         }
 
+        [SandboxMethod("crashLater", Concurrent = true)]
+        public async Task CrashLaterAsync()
+        {
+            // Ignores the token, so it fails after the script has already failed.
+            await Task.Delay(100);
+            throw new InvalidOperationException("the host broke late");
+        }
+
         private async Task<string> HoldAsync(string name, int milliseconds, CancellationToken cancellationToken)
         {
             lock (_lock)
@@ -168,6 +176,42 @@ public class ConcurrentCallTests
         Assert.Equal(1, gate.Finished);
         Assert.True(result.Duration < TimeSpan.FromSeconds(4), result.Duration.ToString());
         Assert.Empty(result.HostErrors);
+    }
+
+    [Fact]
+    public async Task A_host_failure_of_a_call_ended_with_the_script_is_still_recorded()
+    {
+        var gate = new GateApi();
+
+        var result = await Execute(gate, "await Promise.all([gate.crashLater(), gate.failSoon()]);");
+
+        Assert.Equal("PurposeError", result.Error?.Name);
+        var error = Assert.Single(result.HostErrors);
+        Assert.Equal("gate.crashLater", error.Method);
+    }
+
+    [Fact]
+    public async Task Running_calls_count_towards_the_calls_that_can_wait()
+    {
+        var gate = new GateApi();
+
+        // The short call returns to the host and settles while the four long ones still run, so the next 13 calls
+        // are made with 4 running and none queued: only the 13th makes 17.
+        var result = await Execute(
+            gate,
+            """
+            const running = [0, 1, 2, 3].map(i => gate.read('running' + i, 500));
+            await gate.read('tick', 1);
+            const more = [];
+            for (let i = 0; i < 13; i++) more.push(gate.read('more' + i, 1).then(() => 'ok', e => e.name));
+            await Promise.all(running);
+            const settled = await Promise.all(more);
+            return settled.filter(name => name === 'QueueFullError').length;
+            """,
+            builder => builder.WithConcurrentCallLimit(5));
+
+        Assert.True(result.Succeeded, result.Error?.ToString());
+        Assert.Equal("1", result.Json);
     }
 
     [Fact]
