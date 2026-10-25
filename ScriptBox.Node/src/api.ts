@@ -61,6 +61,16 @@ export interface MethodSpec<Context, Params extends TProperties, Result extends 
   readonly result?: Result;
   /** This method's time limit, at most the execution's remaining time. */
   readonly timeoutMs?: number;
+  /**
+   * Lets calls to this method run at the same time as other concurrent calls
+   * of the same execution, up to the `concurrentCalls` limit, so a script that
+   * awaits several together waits about as long as the slowest. Set it only
+   * when the handler, and the filters it passes through, are safe to run
+   * interleaved with themselves and the other concurrent methods: typically
+   * a read. Every other call runs alone: it starts once the calls before it
+   * have finished, and the calls after it wait for it.
+   */
+  readonly concurrent?: boolean;
   /** Facts for filters and capability rules, such as a required role. Never sent to the script. */
   readonly metadata?: Readonly<Record<string, JsonValue>>;
   readonly handler: MethodHandler<Context, Params, Result>;
@@ -112,6 +122,8 @@ export interface MethodDescriptor {
   readonly result: JsonValue | undefined;
   readonly metadata: Readonly<Record<string, JsonValue>>;
   readonly timeoutMs: number | undefined;
+  /** Whether calls may run alongside other concurrent calls. See {@link MethodSpec.concurrent}. */
+  readonly concurrent: boolean;
 }
 
 /** @internal A method with its compiled schemas and its handler. */
@@ -241,6 +253,9 @@ function defineMethod<Context, Params extends TProperties, Result extends TSchem
     if (spec.timeoutMs !== undefined && (!Number.isSafeInteger(spec.timeoutMs) || spec.timeoutMs < 1)) {
       throw new ScriptBoxConfigurationError(`${qualifiedName}'s timeoutMs must be a positive integer.`);
     }
+    if (spec.concurrent !== undefined && typeof spec.concurrent !== 'boolean') {
+      throw new ScriptBoxConfigurationError(`${qualifiedName}'s concurrent must be true or false.`);
+    }
 
     const paramEntries = Object.entries(spec.params ?? {});
     if (paramEntries.length > contractLimits.paramsPerMethod) {
@@ -281,6 +296,7 @@ function defineMethod<Context, Params extends TProperties, Result extends TSchem
       result: resultJson,
       metadata,
       timeoutMs: spec.timeoutMs,
+      concurrent: spec.concurrent === true,
     });
 
     return Object.freeze({
@@ -352,6 +368,8 @@ export function contractDigest(namespaces: readonly { name: string; description:
       description: m.description ?? null,
       effect: m.effect,
       timeoutMs: m.timeoutMs ?? null,
+      // Only when set, so a contract that opts nothing in keeps the digest it had before concurrency existed.
+      ...(m.concurrent ? { concurrent: true } : {}),
       metadata: m.metadata,
       params: m.params.map((p) => ({ name: p.name, optional: p.optional, schema: p.schema })),
       result: m.result ?? null,

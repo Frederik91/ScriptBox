@@ -20,8 +20,10 @@ export interface ExecutionLimits {
   readonly rpcBytes: number;
   /** Host-call attempts, including refused and denied ones and docs calls. */
   readonly hostCalls: number;
-  /** Admitted calls not yet settled, including the one being handled. */
+  /** Admitted calls not yet settled, including the ones being handled. */
   readonly outstandingCalls: number;
+  /** Calls to concurrent methods handled at the same time. */
+  readonly concurrentCalls: number;
   /** The script's returned value as JSON, UTF-8. */
   readonly resultBytes: number;
   readonly logEntries: number;
@@ -50,6 +52,7 @@ export const defaultLimits: ExecutionLimits = Object.freeze({
   rpcBytes: 4 * 1024 * 1024,
   hostCalls: 128,
   outstandingCalls: 16,
+  concurrentCalls: 4,
   resultBytes: 256 * 1024,
   logEntries: 100,
   logEntryBytes: 2 * 1024,
@@ -76,6 +79,7 @@ const ranges: Readonly<Record<keyof ExecutionLimits, readonly [number, number]>>
   rpcBytes: [1024, 1024 * 1024 * 1024],
   hostCalls: [0, 1_000_000],
   outstandingCalls: [1, 1024],
+  concurrentCalls: [1, 1024],
   resultBytes: [16, 64 * 1024 * 1024],
   logEntries: [0, 100_000],
   logEntryBytes: [16, 1024 * 1024],
@@ -118,7 +122,7 @@ export function resolveLimits(base: ExecutionLimits, overrides: Partial<Executio
 
 const limitKeys: readonly (keyof ExecutionLimits)[] = [
   'timeoutMs', 'hostCallTimeoutMs', 'memoryBytes', 'sourceBytes', 'messageBytes', 'rpcBytes', 'hostCalls',
-  'outstandingCalls', 'resultBytes', 'logEntries', 'logEntryBytes', 'evidenceRecords', 'evidenceBytes', 'jsonDepth',
+  'outstandingCalls', 'concurrentCalls', 'resultBytes', 'logEntries', 'logEntryBytes', 'evidenceRecords', 'evidenceBytes', 'jsonDepth',
   'compileTimeoutMs', 'compilerHeapMb', 'workerHeapMb', 'workerStackMb',
 ];
 

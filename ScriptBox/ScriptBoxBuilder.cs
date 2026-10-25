@@ -52,6 +52,7 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     private int _maxLogEntries = 1000;
     private int _maxLogEntryLength = 8 * 1024;
     private int _maxResultBytes = 4 * 1024 * 1024;
+    private int _maxConcurrentCalls = 4;
     private bool _sealHostResults;
     private JsonSerializerOptions? _jsonOptions;
     private Func<Type, object?>? _apiFactory;
@@ -201,6 +202,17 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
     public ScriptBoxBuilder WithResultLimit(int maxBytes)
     {
         _maxResultBytes = maxBytes > 0 ? maxBytes : throw new ArgumentOutOfRangeException(nameof(maxBytes));
+        return this;
+    }
+
+    /// <summary>
+    /// How many calls to methods marked <see cref="SandboxMethodAttribute.Concurrent"/> one execution runs at
+    /// the same time. Further ones wait for a slot. Each running call holds a thread-pool thread for as long
+    /// as its handler blocks one. The default is 4.
+    /// </summary>
+    public ScriptBoxBuilder WithConcurrentCallLimit(int maxCalls)
+    {
+        _maxConcurrentCalls = maxCalls > 0 ? maxCalls : throw new ArgumentOutOfRangeException(nameof(maxCalls));
         return this;
     }
 
@@ -364,6 +376,7 @@ public sealed class ScriptBoxBuilder : IScriptBoxConfigurator
             MaxLogEntries = _maxLogEntries,
             MaxLogEntryLength = _maxLogEntryLength,
             MaxResultBytes = _maxResultBytes,
+            MaxConcurrentCalls = _maxConcurrentCalls,
         };
 
         var box = new ScriptBox(

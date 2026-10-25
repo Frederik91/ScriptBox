@@ -51,6 +51,8 @@ assert.equal(cases.length, items.length, 'every fixture case is well formed');
 
 function confApi(calls: string[]) {
   const kit = createApiKit<null>();
+  const everyoneMet = Promise.withResolvers<true>();
+  let arrived = 0;
   return kit.namespace({
     name: 'conf',
     description: 'Methods for conformance tests.',
@@ -102,6 +104,25 @@ function confApi(calls: string[]) {
         effect: 'read',
         handler: () => {
           throw new Error('database password is hunter2');
+        },
+      }),
+      meet: kit.method({
+        summary: 'Resolves once count calls have arrived.',
+        effect: 'read',
+        concurrent: true,
+        params: { count: Type.Integer({ minimum: 1 }) },
+        result: Type.Integer(),
+        handler: async ({ count }, call) => {
+          if (++arrived >= count) {
+            everyoneMet.resolve(true);
+          }
+          const aborted = new Promise<never>((_resolve, reject) => {
+            call.signal.addEventListener('abort', () => {
+              reject(new Error('aborted'));
+            }, { once: true });
+          });
+          await Promise.race([everyoneMet.promise, aborted]);
+          return count;
         },
       }),
     },

@@ -40,7 +40,17 @@ if (result.Succeeded) Console.WriteLine(result.Json);     // "3"
 else Console.WriteLine(result.Error);                      // name, message, stack with line numbers
 ```
 
-A script is the body of an async function: `return` produces the result, and strict mode is on. Every host call returns a promise, so `await` it. The host answers calls one at a time, in the order the script made them, even under `Promise.all`.
+A script is the body of an async function: `return` produces the result, and strict mode is on. Every host call returns a promise, so `await` it. The host starts calls in the order the script made them, one at a time, even under `Promise.all`, unless the method is marked concurrent.
+
+## Concurrent calls
+
+Mark a method `[SandboxMethod("get", Concurrent = true)]` when its handler, and the filters it passes through, are safe to run in parallel with themselves and with the other concurrent methods. That is typically a read. A script that awaits several such calls together then waits about as long as the slowest one:
+
+```js
+const items = await Promise.all(ids.map(id => store.get(id)));
+```
+
+Concurrent calls start on thread-pool threads, at most 4 at a time per execution (`WithConcurrentCallLimit`). Each settles as soon as its handler finishes. Any other call runs alone: it starts once the calls made before it have finished, and the calls made after it wait for it. So a write never overlaps a read, and calls never pass one another. When the script fails or times out, calls still running see their `CancellationToken` cancelled, and `ExecuteAsync` waits for them before it returns.
 
 ## What a script sees
 
@@ -150,6 +160,7 @@ Together with a declaration filter, this keeps the prompt small. Show the model 
 | `WithExecutionTimeout` | 30 s, host calls included | `ScriptErrorKind.Timeout`; the host call in progress sees its `CancellationToken` cancelled |
 | `WithMemoryLimit` | 256 MiB of linear memory, at least 32 MiB | `ScriptErrorKind.MemoryLimit` |
 | Waiting host calls | 16 | the excess call fails with `QueueFullError` |
+| `WithConcurrentCallLimit` | 4 concurrent calls running at once | further concurrent calls wait for a slot |
 | Recursion | about 3,600 frames deep | a catchable `InternalError: stack overflow` |
 | `WithLogLimits` | 1,000 entries of 8 KB | later output is dropped with a note |
 

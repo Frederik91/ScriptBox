@@ -12,7 +12,8 @@
       "record": "record(tag: string): void. Appends conf.record:<tag> to the host's call log.",
       "item": "item(id: string): { id: string, name: string }. Returns { id, name: 'Item ' + id }.",
       "rename": "rename(change: { id: string, name: string }): { id: string, name: string }. Returns the change.",
-      "crash": "crash(): void. Fails on the host with an internal error whose message must not reach the script."
+      "crash": "crash(): void. Fails on the host with an internal error whose message must not reach the script.",
+      "meet": "meet(count: number): number. Concurrent. Resolves with count once count calls to it have arrived, so the calls succeed only when they run together."
     }
   },
   "cases": [
@@ -253,6 +254,7 @@
           "/api/conf/greet.d.ts",
           "/api/conf/index.d.ts",
           "/api/conf/item.d.ts",
+          "/api/conf/meet.d.ts",
           "/api/conf/record.d.ts",
           "/api/conf/rename.d.ts"
         ]
@@ -399,6 +401,17 @@
         "value": [
           16,
           4
+        ]
+      }
+    },
+    {
+      "name": "calls to a concurrent method awaited together run at the same time",
+      "script": "return await Promise.all([conf.meet(2), conf.meet(2)]);",
+      "expect": {
+        "status": "completed",
+        "value": [
+          2,
+          2
         ]
       }
     },

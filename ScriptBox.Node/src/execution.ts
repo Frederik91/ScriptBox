@@ -134,6 +134,10 @@ interface QueuedCall {
   readonly payload: string;
   readonly bytes: number;
   readonly receivedAt: number;
+  /** Whether it may run alongside other concurrent calls; set when it reaches the head of the queue. */
+  concurrent?: boolean;
+  /** The request, once read to decide {@link concurrent}, so it is read only once. */
+  request?: { method: string; args: JsonValue[]; omitted: number[] };
 }
 
 type Terminal =
@@ -169,7 +173,8 @@ class ExecutionRun<Context> {
   private deadlineTimer: NodeJS.Timeout | undefined;
 
   private readonly queue: QueuedCall[] = [];
-  private inFlight = false;
+  private running = 0;
+  private runningAlone = false;
   private seq = 0;
   private readonly calls: CallRecord[] = [];
   private evidenceBytes = 0;
@@ -684,29 +689,50 @@ class ExecutionRun<Context> {
     });
   }
 
-  /** Dispatches queued calls one at a time, in the order they were admitted. */
+  /**
+   * Dispatches queued calls in the order they were admitted. A concurrent call
+   * joins running concurrent calls while there is a slot; any other call starts
+   * only when nothing runs, and the calls after it wait for it. Each call is
+   * settled as soon as it finishes.
+   */
   private pump(): void {
-    if (this.inFlight || this.terminal !== undefined) {
-      return;
-    }
-    const next = this.queue.shift();
-    if (next === undefined) {
-      return;
-    }
-    this.inFlight = true;
-    void this.dispatch(next).then((response) => {
-      this.inFlight = false;
-      if (this.terminal !== undefined || response === undefined) {
+    while (this.terminal === undefined) {
+      const next = this.queue[0];
+      if (next === undefined) {
         return;
       }
-      this.rpcBytes += utf8Length(response);
-      if (this.rpcBytes > this.limits.rpcBytes) {
-        this.limitReached('rpc-bytes', `Host calls exchanged more than ${this.limits.rpcBytes} bytes.`);
+      next.concurrent ??= this.isConcurrent(next);
+      if (this.running > 0 && (this.runningAlone || !next.concurrent || this.running >= this.limits.concurrentCalls)) {
         return;
       }
-      this.worker?.postMessage({ t: 'settle', id: next.id, response });
-      this.pump();
-    });
+      this.queue.shift();
+      this.running++;
+      this.runningAlone = !next.concurrent;
+      void this.dispatch(next).then((response) => {
+        this.running--;
+        this.runningAlone = false;
+        if (this.terminal !== undefined || response === undefined) {
+          return;
+        }
+        this.rpcBytes += utf8Length(response);
+        if (this.rpcBytes > this.limits.rpcBytes) {
+          this.limitReached('rpc-bytes', `Host calls exchanged more than ${this.limits.rpcBytes} bytes.`);
+          return;
+        }
+        this.worker?.postMessage({ t: 'settle', id: next.id, response });
+        this.pump();
+      });
+    }
+  }
+
+  /** A call that names no host method is answered without a handler, so it can share its turn with anything. */
+  private isConcurrent(queued: QueuedCall): boolean {
+    try {
+      queued.request = readRequest(queued.payload, this.limits);
+    } catch {
+      return true;
+    }
+    return this.runtime.methods.get(queued.request.method)?.descriptor.concurrent ?? true;
   }
 
   /** Handles one admitted call and returns the response for the guest, or undefined when the execution has ended. */
@@ -715,7 +741,7 @@ class ExecutionRun<Context> {
     const startedAtMs = this.elapsedMs();
     let request: { method: string; args: JsonValue[]; omitted: number[] };
     try {
-      request = readRequest(queued.payload, this.limits);
+      request = queued.request ?? readRequest(queued.payload, this.limits);
     } catch {
       return this.respondError(queued, startedAtMs, started, null, 'unknown-method', 'UnknownMethodError', 'The host call was malformed.', false, undefined, '');
     }

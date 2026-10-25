@@ -54,6 +54,22 @@ public class ConformanceTests
         [SandboxMethod("crash")]
         [Description("Fails on the host with an internal error.")]
         public void Crash() => throw new InvalidOperationException("database password is hunter2");
+
+        private readonly TaskCompletionSource<bool> _everyoneMet = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _arrived;
+
+        [SandboxMethod("meet", Concurrent = true)]
+        [Description("Resolves once count calls have arrived.")]
+        public async Task<int> MeetAsync(int count, CancellationToken cancellationToken)
+        {
+            if (Interlocked.Increment(ref _arrived) >= count)
+            {
+                _everyoneMet.TrySetResult(true);
+            }
+
+            await _everyoneMet.Task.WaitAsync(cancellationToken);
+            return count;
+        }
     }
 
     public sealed record Item(string Id, string Name);
