@@ -49,13 +49,13 @@ jobs:
           git diff --exit-code -- ScriptBox.Wasm
           test -z "$(git status --porcelain -- ScriptBox.Wasm)"
 
+      # v6.1 and later write no always-auth, which npm 11 warns about. No dependency cache:
+      # a release must not restore files a pull request run could have written.
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24.x
           registry-url: https://registry.npmjs.org
-          cache: npm
-          cache-dependency-path: ScriptBox.Node/package-lock.json
 
       - name: Install
         run: npm ci
