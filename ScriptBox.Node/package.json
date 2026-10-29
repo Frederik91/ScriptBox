@@ -1,6 +1,6 @@
 {
   "name": "@frederik91/scriptbox",
-  "version": "0.2.0",
+  "version": "4.1.1",
   "description": "Let an AI model write JavaScript or TypeScript against your Node.js API. ScriptBox runs it in a QuickJS WebAssembly sandbox where it reaches only the methods you register, your schemas and policies check every call, and hard limits stop runaway code.",
   "license": "MIT",
   "author": "Frederik Tegnander",
