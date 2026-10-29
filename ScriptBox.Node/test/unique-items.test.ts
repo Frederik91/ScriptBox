@@ -79,20 +79,18 @@ describe('uniqueItems compilation and JSON equality', () => {
 });
 
 describe('uniqueItems on real JS and TS guest calls', () => {
-  test('public registration refuses nonboolean uniqueness and unrelated unsupported keywords', async () => {
+  test('public registration refuses nonboolean uniqueness and unrelated unsupported keywords', () => {
     const kit = createApiKit<null>();
     for (const uniqueItems of [null, 1, 'true', [], {}]) {
-      const apis = kit.namespace({ name: 'sets', methods: {
+      assert.throws(() => kit.namespace({ name: 'sets', methods: {
         echo: kit.method({ summary: 'Invalid contract.', effect: 'read',
           params: { values: Type.Unsafe<JsonValue>({ type: 'array', items: {}, uniqueItems }) }, handler: () => undefined }),
-      } });
-      await assert.rejects(createRuntime<null>({ apis: [apis] }), /uniqueItems must be a boolean/);
+      } }), /uniqueItems must be a boolean/);
     }
-    const apis = kit.namespace({ name: 'sets', methods: {
+    assert.throws(() => kit.namespace({ name: 'sets', methods: {
       echo: kit.method({ summary: 'Invalid contract.', effect: 'read',
         params: { values: Type.Unsafe<JsonValue>({ type: 'array', items: {}, uniqueItems: true, contains: {} }) }, handler: () => undefined }),
-    } });
-    await assert.rejects(createRuntime<null>({ apis: [apis] }), /keyword 'contains'.*not supported/);
+    } }), /keyword 'contains'.*not supported/);
   });
 
   test('one named type cannot describe conflicting uniqueness rules', async () => {
