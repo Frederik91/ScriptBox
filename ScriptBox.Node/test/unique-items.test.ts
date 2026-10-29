@@ -166,7 +166,8 @@ describe('uniqueItems on real JS and TS guest calls', () => {
       assert.match(JSON.stringify(method.result), /"uniqueItems":true/);
       assert.match(runtime.getTypeScriptDeclarations(), /Items must be unique \(JSON structural equality\)/);
       const docs = completed(await session.execute({ language: 'javascript', source: 'return (await docs.read(["/api/sets/echo.d.ts"]))[0].content;' }));
-      assert.equal(typeof docs, 'string'); assert.match(String(docs), /Items must be unique/);
+      assert.ok(typeof docs === 'string');
+      assert.match(docs, /Items must be unique/);
       const replaced = runtime.createSession({ context: null, capabilities: ['sets.*'], filters: [() => [1, 1]] });
       const before = calls.length;
       const outcome = await replaced.execute({ language: 'javascript', source: 'try { await sets.echo([1,2]); return "accepted"; } catch { return "rejected"; }' });
