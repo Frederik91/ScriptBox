@@ -233,6 +233,9 @@ function constraints(node: SchemaNode): string[] {
       } else if (node.maxItems !== undefined) {
         notes.push(`At most ${node.maxItems} items.`);
       }
+      if (node.uniqueItems) {
+        notes.push('Items must be unique (JSON structural equality).');
+      }
       break;
     case 'record':
       if (node.maxProperties !== undefined) {
@@ -286,7 +289,7 @@ function toJson(node: SchemaNode): JsonValue {
     case 'enum':
       return { kind: node.kind, values: [...node.values], name: node.typeName ?? null };
     case 'array':
-      return { kind: node.kind, items: toJson(node.items), name: node.typeName ?? null };
+      return { kind: node.kind, items: toJson(node.items), uniqueItems: node.uniqueItems, name: node.typeName ?? null };
     case 'object':
       return { kind: node.kind, name: node.typeName ?? null, properties: node.properties.map((p) => ({ name: p.name, required: p.required, node: toJson(p.node) })) };
     case 'record':
