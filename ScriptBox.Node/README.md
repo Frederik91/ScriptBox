@@ -127,7 +127,15 @@ Values cross between script and host as JSON.
 - A method with no result resolves to `undefined` in the script.
 - A script that returns nothing completes with `value: null` and `hasValue: false`.
 
-Supported schema shapes: string (length, pattern), number and integer (ranges), boolean, null, literal, enum, array (item count), object, record (`Type.Record(Type.String(), ...)`), union, and any JSON (`Type.Unsafe<JsonValue>({})`). A union of objects needs a literal discriminant. `$ref`, `allOf`, `oneOf`, `not`, `if`, `format`, tuples and recursive schemas are refused when you register the method, with the path to the keyword.
+Supported schema shapes: string (length, pattern), number and integer (ranges), boolean, null, literal, enum, array (item count and boolean `uniqueItems`), object, record (`Type.Record(Type.String(), ...)`), union, and any JSON (`Type.Unsafe<JsonValue>({})`). A union of objects needs a literal discriminant. `$ref`, `allOf`, `oneOf`, `not`, `if`, `format`, tuples and recursive schemas are refused when you register the method, with the path to the keyword.
+
+Use `Type.Array(Type.String(), { uniqueItems: true, maxItems: 16 })` for a set of selector values. Uniqueness uses JSON structural equality: object property order does not matter, array order does, and `-0` equals `0`. Different JSON types stay distinct. Strings compare exactly, without Unicode normalization. Duplicate arguments fail with `InvalidArgumentsError` before the handler runs; duplicate handler or filter results fail with `HostError` and `invalid-result` evidence. `false` or omission permits duplicates. A nonboolean `uniqueItems` is refused at registration; other unsupported keywords remain refused.
+
+Uniqueness checks the values the boundary exposes: arguments after defaults are filled in, and results after undeclared properties are projected away. For example, two result objects distinguished only by private fields are duplicates. A default that makes two argument objects equal also fails. Generated JSON schemas retain the boolean and declarations/docs describe the constraint; TypeScript array types alone cannot prove uniqueness.
+
+The check runs after item validation and count limits, and after byte-budgeted result projection. Input message byte/depth limits still apply. One validation walk interns exact structural identities using immediate child IDs, with object keys sorted and subtree identities reused; it performs no pairwise deep comparisons and retains no identity cache across calls. Memory is proportional to the bounded validated JSON, with sorting work for object keys. No additional schema keyword or execution limit is introduced.
+
+This keyword is enforced by the Node host. The .NET host gains no array-uniqueness option from this change; applications needing the same constraint on both hosts must enforce it there as well. The shared guest ABI, bootstrap, transport, and conformance fixtures are unchanged.
 
 ## Sessions, capabilities and discovery
 

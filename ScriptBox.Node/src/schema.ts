@@ -1,6 +1,7 @@
 import { ScriptBoxConfigurationError } from './errors.ts';
 import { isRecord, utf8Length, type JsonValue } from './json.ts';
 import { contractLimits } from './limits.ts';
+import { createJsonIdentity, type JsonIdentity } from './unique-items.ts';
 
 /**
  * The part of JSON Schema a method contract may use, compiled once at
@@ -70,6 +71,7 @@ export interface ArrayNode extends NodeBase {
   readonly items: SchemaNode;
   readonly minItems: number | undefined;
   readonly maxItems: number | undefined;
+  readonly uniqueItems: boolean;
 }
 
 export interface PropertyNode {
@@ -108,7 +110,7 @@ const allowedKeys: Readonly<Record<string, ReadonlySet<string>>> = {
   integer: new Set(['type', 'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum']),
   boolean: new Set(['type']),
   null: new Set(['type']),
-  array: new Set(['type', 'items', 'minItems', 'maxItems']),
+  array: new Set(['type', 'items', 'minItems', 'maxItems', 'uniqueItems']),
   object: new Set(['type', 'properties', 'required', 'additionalProperties']),
   record: new Set(['type', 'patternProperties', 'maxProperties']),
   literal: new Set(['type', 'const']),
@@ -205,6 +207,7 @@ function compileNode(schema: unknown, path: string, depth: number, state: Compil
         items: compileNode(schema['items'], `${path}.items`, depth + 1, state),
         minItems: optionalCount(schema, 'minItems', path),
         maxItems: optionalCount(schema, 'maxItems', path),
+        uniqueItems: optionalBoolean(schema, 'uniqueItems', path) ?? false,
       };
       break;
     case 'object':
@@ -374,6 +377,17 @@ function optionalString(schema: Readonly<Record<string, unknown>>, key: string, 
   }
   if (typeof value !== 'string') {
     fail(path, `${key} must be a string.`);
+  }
+  return value;
+}
+
+function optionalBoolean(schema: Readonly<Record<string, unknown>>, key: string, path: string): boolean | undefined {
+  if (!Object.hasOwn(schema, key)) {
+    return undefined;
+  }
+  const value = schema[key];
+  if (typeof value !== 'boolean') {
+    fail(path, `${key} must be a boolean.`);
   }
   return value;
 }
@@ -552,6 +566,10 @@ function propertyPath(path: string, name: string): string {
  * object property the schema does not declare is an error.
  */
 export function validateInput(node: SchemaNode, value: unknown, path: string, issues: Issue[]): JsonValue | typeof invalid {
+  return validate(node, value, path, issues, createJsonIdentity());
+}
+
+function validate(node: SchemaNode, value: unknown, path: string, issues: Issue[], identity: JsonIdentity): JsonValue | typeof invalid {
   switch (node.kind) {
     case 'string':
       return typeof value === 'string' ? checkString(node, value, path, issues) : mismatch(node, value, path, issues);
@@ -584,7 +602,7 @@ export function validateInput(node: SchemaNode, value: unknown, path: string, is
       const result: JsonValue[] = [];
       let failed = false;
       for (let i = 0; i < items.length; i++) {
-        const item = validateInput(node.items, items[i], `${path}[${i}]`, issues);
+        const item = validate(node.items, items[i], `${path}[${i}]`, issues, identity);
         if (item === invalid) {
           failed = true;
           if (issues.length >= maxIssues) {
@@ -594,7 +612,10 @@ export function validateInput(node: SchemaNode, value: unknown, path: string, is
           result.push(item);
         }
       }
-      return failed ? invalid : result;
+      if (failed) {
+        return invalid;
+      }
+      return checkUnique(node, result, path, issues, identity);
     }
     case 'object': {
       if (!isRecord(value)) {
@@ -619,7 +640,7 @@ export function validateInput(node: SchemaNode, value: unknown, path: string, is
           }
           continue;
         }
-        const item = validateInput(property.node, value[property.name], itemPath, issues);
+        const item = validate(property.node, value[property.name], itemPath, issues, identity);
         if (item === invalid) {
           failed = true;
         } else {
@@ -639,7 +660,7 @@ export function validateInput(node: SchemaNode, value: unknown, path: string, is
       const result: Record<string, JsonValue> = {};
       let failed = false;
       for (const key of keys) {
-        const item = validateInput(node.values, value[key], propertyPath(path, key), issues);
+        const item = validate(node.values, value[key], propertyPath(path, key), issues, identity);
         if (item === invalid) {
           failed = true;
         } else {
@@ -649,10 +670,20 @@ export function validateInput(node: SchemaNode, value: unknown, path: string, is
       return failed ? invalid : result;
     }
     case 'union':
-      return validateUnion(node, value, path, issues, validateInput);
+      return validateUnion(node, value, path, issues, (option, item, itemPath, itemIssues) => validate(option, item, itemPath, itemIssues, identity));
     case 'json':
       return copyJson(value, path, issues, 0);
   }
+}
+
+function checkUnique(node: ArrayNode, items: JsonValue[], path: string, issues: Issue[], identity: JsonIdentity): JsonValue[] | typeof invalid {
+  if (node.uniqueItems) {
+    const duplicate = identity.firstDuplicate(items);
+    if (duplicate !== undefined) {
+      return report(issues, `${path}[${duplicate}]`, 'must be unique within this array (JSON structural equality).');
+    }
+  }
+  return items;
 }
 
 function mismatch(node: SchemaNode, value: unknown, path: string, issues: Issue[]): typeof invalid {
@@ -753,6 +784,7 @@ interface Budget {
   used: number;
   readonly max: number;
   readonly seen: Set<object>;
+  readonly identity: JsonIdentity;
 }
 
 function spend(budget: Budget, bytes: number): void {
@@ -770,7 +802,7 @@ function spend(budget: Budget, bytes: number): void {
  * more than the limit to reject.
  */
 export function projectOutput(node: SchemaNode, value: unknown, path: string, issues: Issue[], maxBytes: number): JsonValue | typeof invalid {
-  return project(node, value, path, issues, { used: 0, max: maxBytes, seen: new Set() });
+  return project(node, value, path, issues, { used: 0, max: maxBytes, seen: new Set(), identity: createJsonIdentity() });
 }
 
 function project(node: SchemaNode, value: unknown, path: string, issues: Issue[], budget: Budget): JsonValue | typeof invalid {
@@ -808,7 +840,7 @@ function project(node: SchemaNode, value: unknown, path: string, issues: Issue[]
         spend(budget, 1);
         result.push(item);
       }
-      return result;
+      return checkUnique(node, result, path, issues, budget.identity);
     }
     case 'object': {
       if (typeof value !== 'object' || value === null || Array.isArray(value)) {
